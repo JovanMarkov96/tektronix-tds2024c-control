@@ -813,7 +813,10 @@ class TDS2024CGUI(QMainWindow):
         )
         self._plot_widget.addItem(self._trig_line)
 
-        # V/div label strip: bottom-left corner of plot viewport
+        # V/div label strip: bottom-left corner of plot viewport.
+        # Color is driven per-channel via HTML in _update_vdiv_label; we set
+        # a non-empty color here only to ensure LabelItem initialises its
+        # QGraphicsTextItem in the correct font size.
         self._vdiv_label = pg.LabelItem(text="", justify="left",
                                         color="#cccccc", size="8pt")
         self._vdiv_label.setParentItem(self._plot_widget.getPlotItem())
@@ -1211,15 +1214,33 @@ class TDS2024CGUI(QMainWindow):
             self._trig_line.setVisible(False)
 
     def _update_vdiv_label(self):
-        """Refresh the per-channel V/div + time/div text strip (bottom-left)."""
+        """Refresh per-channel V/div + time/div strip (bottom-left, colored per channel).
+
+        Uses HTML injected directly into LabelItem.item (QGraphicsTextItem) so that
+        each channel label carries its own trace colour — pyqtgraph's setText() only
+        supports a single uniform color for the whole item.
+        """
         if self._vdiv_label is None:
             return
         parts = []
         for i, ch in enumerate(Channel.analog()):
             if self._ch_widgets[ch]["display"].isChecked():
-                parts.append(f"{ch.value}: {_eng_v(self._ch_v_per_div.get(ch, 0.5))}")
-        parts.append(_eng_t(self._time_scale_s))
-        self._vdiv_label.setText("   ".join(parts))
+                colour = _CH_COLOURS[i]
+                txt = f"{ch.value}: {_eng_v(self._ch_v_per_div.get(ch, 0.5))}"
+                parts.append(f"<span style='color:{colour};'>{txt}</span>")
+        t_txt = _eng_t(self._time_scale_s)
+        parts.append(f"<span style='color:#aaaaaa;'>{t_txt}</span>")
+        html = ("<span style='font-size:8pt;'>"
+                + "&nbsp;&nbsp;&nbsp;".join(parts)
+                + "</span>")
+        self._vdiv_label.item.setHtml(html)
+        # Notify the LabelItem that its content changed so it re-measures itself.
+        try:
+            self._vdiv_label.updateMin()
+            self._vdiv_label.resizeEvent(None)
+            self._vdiv_label.updateGeometry()
+        except Exception:
+            pass
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
