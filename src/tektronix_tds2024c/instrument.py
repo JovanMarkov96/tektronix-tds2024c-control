@@ -55,6 +55,12 @@ class TDS2024C:
         self._timeout_ms = timeout_ms
         self._rm: Optional[pyvisa.ResourceManager] = None
         self._inst: Optional[pyvisa.resources.MessageBasedResource] = None
+        self._wfm_encoding: WfmEncoding = WfmEncoding.RIBINARY
+        # Per-channel preamble cache. WFMPre? takes ~1 s on TDS2000B firmware,
+        # but the preamble (scaling, time base) only changes when the user
+        # touches V/div, time/div, position, probe, etc. — so cache it and
+        # invalidate from those setters.
+        self._preamble_cache: dict[Channel, WaveformPreamble] = {}
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -120,7 +126,24 @@ class TDS2024C:
 
     # ── Acquisition ────────────────────────────────────────────────────────────
 
+    def invalidate_preamble_cache(self, ch: Optional[Channel] = None) -> None:
+        """Drop the cached WFMPre? response.  Called automatically by setters
+        that change scaling; call explicitly to force a fresh fetch on the next
+        :meth:`read_waveform`.
+
+        Parameters
+        ----------
+        ch: if ``None``, clears the entire cache (e.g. time base changed);
+            otherwise clears only the entry for that channel.
+        """
+        if ch is None:
+            self._preamble_cache.clear()
+        else:
+            self._preamble_cache.pop(ch, None)
+
     def set_acq_mode(self, mode: AcqMode) -> None:
+        # PEAK changes PT_FMT (Y→ENV) and doubles point count — invalidate all.
+        self.invalidate_preamble_cache()
         self._write(f"ACQuire:MODe {mode.value}")
 
     def get_acq_mode(self) -> AcqMode:
@@ -204,12 +227,14 @@ class TDS2024C:
     # ── Vertical (Channel) ─────────────────────────────────────────────────────
 
     def set_channel_scale(self, ch: Channel, v_per_div: float) -> None:
+        self.invalidate_preamble_cache(ch)
         self._write(f"{ch.value}:SCAle {v_per_div:.6E}")
 
     def get_channel_scale(self, ch: Channel) -> float:
         return float(self._query(f"{ch.value}:SCAle?"))
 
     def set_channel_position(self, ch: Channel, divs: float) -> None:
+        self.invalidate_preamble_cache(ch)
         self._write(f"{ch.value}:POSition {divs:.4f}")
 
     def get_channel_position(self, ch: Channel) -> float:
@@ -228,6 +253,7 @@ class TDS2024C:
         return BandwidthLimit(self._query(f"{ch.value}:BANdwidth?"))
 
     def set_channel_probe(self, ch: Channel, attenuation: float) -> None:
+        self.invalidate_preamble_cache(ch)
         self._write(f"{ch.value}:PROBe {attenuation:g}")
 
     def get_channel_probe(self, ch: Channel) -> float:
@@ -242,12 +268,14 @@ class TDS2024C:
     # ── Horizontal ─────────────────────────────────────────────────────────────
 
     def set_time_scale(self, s_per_div: float) -> None:
+        self.invalidate_preamble_cache()   # XINcr affects every channel
         self._write(f"HORizontal:MAIn:SCAle {s_per_div:.6E}")
 
     def get_time_scale(self) -> float:
         return float(self._query("HORizontal:MAIn:SCAle?"))
 
     def set_time_position(self, seconds: float) -> None:
+        self.invalidate_preamble_cache()
         self._write(f"HORizontal:MAIn:POSition {seconds:.6E}")
 
     def get_time_position(self) -> float:
@@ -343,15 +371,19 @@ class TDS2024C:
         self._write(f"DATa:SOUrce {ch.value}")
 
     def set_waveform_encoding(self, enc: WfmEncoding) -> None:
+        self.invalidate_preamble_cache()
         self._write(f"DATa:ENCdg {enc.value}")
 
     def set_waveform_width(self, width: WfmWidth) -> None:
+        self.invalidate_preamble_cache()
         self._write(f"DATa:WIDth {int(width.value)}")
 
     def set_waveform_start(self, point: int) -> None:
+        self.invalidate_preamble_cache()
         self._write(f"DATa:STARt {int(point)}")
 
     def set_waveform_stop(self, point: int) -> None:
+        self.invalidate_preamble_cache()
         self._write(f"DATa:STOP {int(point)}")
 
     def get_waveform_preamble(self) -> WaveformPreamble:
@@ -372,31 +404,50 @@ class TDS2024C:
         finally:
             self._inst.read_termination = old_term
 
-    def capture_waveform(
+    def prepare_waveform_transfer(
         self,
-        ch: Channel,
         encoding: WfmEncoding = WfmEncoding.RIBINARY,
+        width: WfmWidth = WfmWidth.ONE_BYTE,
         start: int = 1,
         stop: int = _RECORD_LENGTH,
-    ) -> WaveformRecord:
-        """Capture and decode a waveform from ``ch``.
+    ) -> None:
+        """Configure the static data-transfer parameters once.
 
-        Binary (``RIBINARY``) is used by default and read via
-        ``query_binary_values``, which parses the IEEE block header and reads
-        exactly the declared number of bytes — robust against the LF terminator.
+        Encoding / width / start / stop almost never change between captures,
+        so setting them a single time (rather than on every capture) removes
+        four command round-trips per frame.  This matters a lot for fast
+        repeated capture (live streaming): pair this with :meth:`read_waveform`.
+        """
+        self._require_connection()
+        self.set_waveform_encoding(encoding)
+        self.set_waveform_width(width)
+        self.set_waveform_start(start)
+        self.set_waveform_stop(stop)
+        self._wfm_encoding = encoding
+
+    def read_waveform(self, ch: Channel, refresh_preamble: bool = False) -> WaveformRecord:
+        """Read one waveform using the format set by :meth:`prepare_waveform_transfer`.
+
+        Uses a cached preamble when available — ``WFMPre?`` on TDS2000B firmware
+        takes ~1 s, but the preamble only changes when scaling/timebase/probe
+        changes, and those setters invalidate the cache automatically.  Pass
+        ``refresh_preamble=True`` to force a fresh fetch (e.g. after the user
+        adjusts the scope's front-panel knobs out-of-band).
+
+        Sends ``DATa:SOUrce`` + (cached or one-time ``WFMPre?``) + ``CURVe?``.
         """
         self._require_connection()
         self.set_waveform_source(ch)
-        self.set_waveform_encoding(encoding)
-        self.set_waveform_width(WfmWidth.ONE_BYTE)
-        self.set_waveform_start(start)
-        self.set_waveform_stop(stop)
-
-        preamble = self.get_waveform_preamble()
+        preamble = None if refresh_preamble else self._preamble_cache.get(ch)
+        if preamble is None:
+            preamble = self.get_waveform_preamble()
+            self._preamble_cache[ch] = preamble
+        encoding = self._wfm_encoding
 
         if encoding == WfmEncoding.ASCII:
-            ascii_data = self._query("CURVe?")
-            return WaveformRecord.from_preamble_and_ascii(ch, preamble, ascii_data)
+            return WaveformRecord.from_preamble_and_ascii(
+                ch, preamble, self._query("CURVe?")
+            )
 
         # datatype 'b' = signed byte (RIBinary); 'B' = unsigned (RPBinary)
         datatype = "B" if encoding == WfmEncoding.RPBINARY else "b"
@@ -410,6 +461,21 @@ class TDS2024C:
         except pyvisa.VisaIOError as exc:
             raise TDS2024CConnectionError(f"CURVe? transfer failed: {exc}") from exc
         return WaveformRecord.from_preamble_and_samples(ch, preamble, samples)
+
+    def capture_waveform(
+        self,
+        ch: Channel,
+        encoding: WfmEncoding = WfmEncoding.RIBINARY,
+        start: int = 1,
+        stop: int = _RECORD_LENGTH,
+    ) -> WaveformRecord:
+        """Capture and decode a waveform from ``ch`` (one-shot: configure + read).
+
+        For repeated capture of the same format, call
+        :meth:`prepare_waveform_transfer` once then :meth:`read_waveform` per frame.
+        """
+        self.prepare_waveform_transfer(encoding=encoding, start=start, stop=stop)
+        return self.read_waveform(ch)
 
     def capture_displayed_channels(
         self,

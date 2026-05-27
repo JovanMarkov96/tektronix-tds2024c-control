@@ -102,7 +102,7 @@ class _OscWorker(QThread):
         self._running = False
         self._free_run = False
         self._free_run_channels: list[Channel] = [Channel.CH1]
-        self._free_run_interval_ms = 500
+        self._free_run_interval_ms = 100
         self._resource = ""
 
     # ── Public API (called from GUI thread) ────────────────────────────────────
@@ -212,24 +212,26 @@ class _OscWorker(QThread):
 
     def run(self) -> None:
         self._running = True
-        _last_free_run = 0.0
+        last_capture = 0.0
+        last_trig = 0.0
         while self._running:
             self._drain_queue()
 
             if self._osc and self._free_run:
                 now = time.monotonic()
-                if now - _last_free_run >= self._free_run_interval_ms / 1000.0:
-                    _last_free_run = now
+                if now - last_capture >= self._free_run_interval_ms / 1000.0:
+                    last_capture = now
                     self._do_free_run_capture()
+                # Trigger-state indicator only needs ~2 Hz; polling it every loop
+                # iteration would steal VISA bandwidth from waveform capture.
+                if now - last_trig >= 0.5:
+                    last_trig = now
+                    try:
+                        self.trig_state_signal.emit(self._osc.get_trigger_state())
+                    except Exception:
+                        pass
 
-                # Poll trigger state every 500 ms for indicator
-                try:
-                    state = self._osc.get_trigger_state()
-                    self.trig_state_signal.emit(state)
-                except Exception:
-                    pass
-
-            self.msleep(50)
+            self.msleep(5)
 
     def stop(self) -> None:
         self._running = False
@@ -275,6 +277,9 @@ class _OscWorker(QThread):
             self._osc = TDS2024C(resource)
             self._osc.connect()
             idn = self._osc.identify()
+            # Set the static waveform-transfer format once; live capture then
+            # only sends source + preamble + curve per frame.
+            self._osc.prepare_waveform_transfer()
             self.connected_signal.emit(idn)
             self.log_signal.emit(f"Connected: {resource}")
             self._emit_settings_snapshot()
@@ -298,7 +303,7 @@ class _OscWorker(QThread):
         records = {}
         for ch in self._free_run_channels:
             try:
-                records[ch] = self._osc.capture_waveform(ch)
+                records[ch] = self._osc.read_waveform(ch)   # fast path (format preset)
             except Exception:
                 pass
         if records:
@@ -351,6 +356,8 @@ class TDS2024CGUI(QMainWindow):
 
         self._build_ui()
         self._set_connected(False)
+        # Pre-fill the resource dropdown so the user can just click Connect.
+        self._discover()
 
     # ── UI construction ────────────────────────────────────────────────────────
 
@@ -550,8 +557,8 @@ class TDS2024CGUI(QMainWindow):
 
         ctrl.addWidget(QLabel("Interval:"))
         self._refresh_spin = QSpinBox()
-        self._refresh_spin.setRange(100, 10000)
-        self._refresh_spin.setValue(500)
+        self._refresh_spin.setRange(20, 10000)
+        self._refresh_spin.setValue(100)
         self._refresh_spin.setSuffix(" ms")
         ctrl.addWidget(self._refresh_spin)
 
