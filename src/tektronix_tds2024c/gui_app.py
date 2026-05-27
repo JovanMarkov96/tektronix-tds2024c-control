@@ -11,6 +11,7 @@ Launch:
 
 from __future__ import annotations
 
+import math
 import queue
 import time
 from typing import Optional
@@ -59,13 +60,29 @@ from .models import (
 )
 from .waveform import WaveformRecord
 
-# ── Colour palette for 4 channels ─────────────────────────────────────────────
-_CH_COLOURS = ["#FFD700", "#00BFFF", "#FF6B6B", "#98FB98"]  # gold, sky, red, green
+# ── Colour palette ─────────────────────────────────────────────────────────────
+_CH_COLOURS = ["#FFD700", "#00BFFF", "#FF6B6B", "#98FB98"]   # CH1–CH4: gold, sky, red, green
+_CH_IDX = {"CH1": 0, "CH2": 1, "CH3": 2, "CH4": 3}          # source-string → colour index
+
+# ── Trigger-state display (module-level constants, not rebuilt on every call) ──
+_TRIG_STATE_COLOURS = {
+    "ARMED":   "#FFA500",
+    "AUTO":    "#4FC3F7",
+    "READY":   "#66BB6A",
+    "SAVE":    "#CE93D8",
+    "TRIGGER": "#FFD700",
+}
+_TRIG_STATE_LABELS = {
+    "ARMED": "ARMED", "AUTO": "AUTO", "READY": "READY",
+    "SAVE": "SAVE", "TRIGGER": "TRIG'D",
+}
 
 # ── Standard V/div values ─────────────────────────────────────────────────────
 _V_DIV_OPTIONS = [0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0]
 _V_DIV_LABELS  = ["2mV", "5mV", "10mV", "20mV", "50mV",
                    "100mV", "200mV", "500mV", "1V", "2V", "5V"]
+# Pre-built lookup: value → index (avoids linear scan on every settings poll)
+_V_DIV_INDEX = {v: i for i, v in enumerate(_V_DIV_OPTIONS)}
 
 # ── Standard time/div values ──────────────────────────────────────────────────
 _T_DIV_OPTIONS = [
@@ -80,46 +97,56 @@ _T_DIV_LABELS = [
     "1ms","2.5ms","5ms","10ms","25ms","50ms","100ms","250ms","500ms",
     "1s","2.5s","5s","10s","25s","50s",
 ]
+_T_DIV_INDEX = {v: i for i, v in enumerate(_T_DIV_OPTIONS)}
 
-# ── Trigger-coupling display names ────────────────────────────────────────────
+# ── Trigger coupling ───────────────────────────────────────────────────────────
 _TRIG_COUP_DISPLAY = ["DC", "AC", "HFRej", "LFRej", "NoiseRej"]
-_TRIG_COUP_ENUM = [
+_TRIG_COUP_ENUM    = [
     TriggerCoupling.DC, TriggerCoupling.AC,
     TriggerCoupling.HF_REJ, TriggerCoupling.LF_REJ, TriggerCoupling.NOISE_REJ,
 ]
-# Map upper-cased SCPI response → display label
-_TRIG_COUP_FROM_SCPI = {
+_TRIG_COUP_BY_LABEL = dict(zip(_TRIG_COUP_DISPLAY, _TRIG_COUP_ENUM))  # display → enum
+_TRIG_COUP_FROM_SCPI = {                                               # SCPI upper → display
     "DC": "DC", "AC": "AC",
     "HFREJ": "HFRej", "LFREJ": "LFRej", "NOISEREJ": "NoiseRej",
 }
 
+# ── Acquisition mode ───────────────────────────────────────────────────────────
+_ACQ_MODE_DISPLAY = ["Sample", "Peak", "Average"]
+_ACQ_MODE_ENUM    = [AcqMode.SAMPLE, AcqMode.PEAK, AcqMode.AVERAGE]
 
-def _eng_v(value: float) -> str:
-    """Format voltage with engineering prefix."""
-    abs_v = abs(value)
+
+def _eng_v(v_per_div: float) -> str:
+    """Format V/div with engineering prefix, always includes '/div'."""
+    abs_v = abs(v_per_div)
     if abs_v == 0:
-        return "0 V"
+        return "0 V/div"
     if abs_v >= 1.0:
-        return f"{value:.4g} V/div"
+        return f"{v_per_div:.4g} V/div"
     if abs_v >= 1e-3:
-        return f"{value*1e3:.4g} mV/div"
-    return f"{value*1e6:.4g} µV/div"
+        return f"{v_per_div*1e3:.4g} mV/div"
+    return f"{v_per_div*1e6:.4g} µV/div"
 
 
-def _eng_t(value: float) -> str:
-    """Format time with engineering prefix."""
-    abs_v = abs(value)
+def _eng_t(s_per_div: float) -> str:
+    """Format time/div with engineering prefix."""
+    abs_v = abs(s_per_div)
     if abs_v == 0:
         return "0 s/div"
     if abs_v >= 1.0:
-        return f"{value:.4g} s/div"
+        return f"{s_per_div:.4g} s/div"
     if abs_v >= 1e-3:
-        return f"{value*1e3:.4g} ms/div"
+        return f"{s_per_div*1e3:.4g} ms/div"
     if abs_v >= 1e-6:
-        return f"{value*1e6:.4g} µs/div"
+        return f"{s_per_div*1e6:.4g} µs/div"
     if abs_v >= 1e-9:
-        return f"{value*1e9:.4g} ns/div"
-    return f"{value:.3g} s/div"
+        return f"{s_per_div*1e9:.4g} ns/div"
+    return f"{s_per_div:.3g} s/div"
+
+
+def _closest_index(options: list, value: float) -> int:
+    """Return the index in *options* whose value is closest to *value*."""
+    return min(range(len(options)), key=lambda i: abs(options[i] - value))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -133,9 +160,9 @@ class _OscWorker(QThread):
     disconnected_signal = Signal()
     waveform_signal     = Signal(object)           # dict[Channel, WaveformRecord]
     measurement_signal  = Signal(float, str, str)  # value, units, type_name
-    settings_signal     = Signal(dict)             # scope settings snapshot
+    settings_signal     = Signal(dict)             # scope settings snapshot (no trig_state)
     log_signal          = Signal(str)
-    trig_state_signal   = Signal(str)
+    trig_state_signal   = Signal(str)              # separate — high-frequency badge updates
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -146,10 +173,12 @@ class _OscWorker(QThread):
         self._free_run_channels: list[Channel] = [Channel.CH1]
         self._free_run_interval_ms = 100
         self._resource = ""
-        # Bidirectional sync: poll device settings at ~1.3 Hz
-        self._state_poll_interval_ms = 750
-        self._last_state_poll = 0.0
+        # Bidirectional sync
+        self._state_poll_interval_ms = 750   # idle polling rate
+        self._last_settings_poll = 0.0
+        self._last_trig_poll = 0.0
         self._last_emitted_state: dict = {}
+        self._last_trig_state = ""
 
     # ── Public API (called from GUI thread) ────────────────────────────────────
 
@@ -167,17 +196,26 @@ class _OscWorker(QThread):
             records = {}
             for ch in channels:
                 try:
-                    records[ch] = self._osc.capture_waveform(ch)
+                    # Use read_waveform (not capture_waveform) so that
+                    # prepare_waveform_transfer is NOT called again — calling
+                    # it would invalidate the entire preamble cache and cause
+                    # the next free-run frame to stall for N×~1 s re-fetching
+                    # WFMPre? for every channel.  The transfer format was
+                    # already configured once in _do_connect.
+                    records[ch] = self._osc.read_waveform(ch)
                 except Exception as e:
                     self.log_signal.emit(f"Capture {ch.value} failed: {e}")
-            self.waveform_signal.emit(records)
+            if records:
+                self.waveform_signal.emit(records)
         self._enqueue("single_shot", _do)
 
     def cmd_set_free_run(self, enabled: bool, channels: list[Channel],
                          interval_ms: int) -> None:
-        self._free_run = enabled
+        # Set _free_run last so the worker never sees enabled=True with
+        # the old channel list (avoids a benign CPython GIL-window race).
         self._free_run_channels = channels
         self._free_run_interval_ms = interval_ms
+        self._free_run = enabled
 
     def cmd_measure(self, ch: Channel, mtype: MeasType) -> None:
         def _do():
@@ -251,6 +289,14 @@ class _OscWorker(QThread):
             self._osc.set_trigger_coupling(coupling)
         self._enqueue("trig_coupling", _do)
 
+    def cmd_set_acq_mode(self, mode: AcqMode, numavg: int) -> None:
+        def _do():
+            assert self._osc
+            self._osc.set_acq_mode(mode)
+            if mode == AcqMode.AVERAGE:
+                self._osc.set_acq_numavg(numavg)
+        self._enqueue("acq_mode", _do)
+
     def cmd_trigger_to_50pct(self) -> None:
         def _do():
             assert self._osc
@@ -263,17 +309,27 @@ class _OscWorker(QThread):
             self._osc.force_trigger()
         self._enqueue("force_trigger", _do)
 
-    def cmd_set_acq_mode(self, mode: AcqMode, numavg: int) -> None:
-        def _do():
-            assert self._osc
-            self._osc.set_acq_mode(mode)
-            if mode == AcqMode.AVERAGE:
-                self._osc.set_acq_numavg(numavg)
-        self._enqueue("acq_mode", _do)
-
     # ── QThread entry point ────────────────────────────────────────────────────
 
     def run(self) -> None:
+        """Main worker loop.
+
+        Two separate poll schedules:
+
+        *Trigger-state badge* (trig_state_signal):
+          - During free-run: every ~500 ms (single VISA query, minimal overhead)
+          - During idle:     covered by the full settings poll below
+
+        *Full settings poll* (settings_signal):
+          - During free-run: every ~3 s  ← avoids the ~600–1200 ms VISA block
+                                           that 20+ queries would cause if fired
+                                           at 750 ms while captures are running
+          - During idle:     every 750 ms (fast device→GUI sync when scope is static)
+
+        ``trig_state`` is *excluded* from the settings comparison so that a
+        cycling trigger state (ARMED → TRIGGER → AUTO → …) does not defeat the
+        "emit only when something changed" guard and spam _on_settings every tick.
+        """
         self._running = True
         last_capture = 0.0
         while self._running:
@@ -282,23 +338,38 @@ class _OscWorker(QThread):
             if self._osc:
                 now = time.monotonic()
 
+                # ── Waveform capture ──────────────────────────────────────────
                 if self._free_run:
                     if now - last_capture >= self._free_run_interval_ms / 1000.0:
                         last_capture = now
                         self._do_free_run_capture()
 
-                # Device → GUI state-poll: emit only when something changed
-                if now - self._last_state_poll >= self._state_poll_interval_ms / 1000.0:
-                    self._last_state_poll = now
+                # ── Trigger-state badge (lightweight, ~500 ms during free-run) ─
+                if self._free_run and now - self._last_trig_poll >= 0.5:
+                    self._last_trig_poll = now
                     try:
-                        snap = self._build_state_snapshot()
-                        if snap != self._last_emitted_state:
-                            self._last_emitted_state = snap
-                            self.settings_signal.emit(snap)
-                        # Trigger state always forwarded so the badge stays live
-                        state = snap.get("trig_state", "")
-                        if state:
+                        state = self._osc.get_trigger_state()
+                        if state != self._last_trig_state:
+                            self._last_trig_state = state
                             self.trig_state_signal.emit(state)
+                    except Exception:
+                        pass
+
+                # ── Full settings poll ────────────────────────────────────────
+                # Longer interval during free-run so the ~20 VISA queries don't
+                # block waveform capture for a full second every 750 ms.
+                settings_interval = (3.0 if self._free_run
+                                     else self._state_poll_interval_ms / 1000.0)
+                if now - self._last_settings_poll >= settings_interval:
+                    self._last_settings_poll = now
+                    try:
+                        snap, trig_state = self._build_state_snapshot()
+                        if snap != self._last_emitted_state:
+                            self._last_emitted_state = snap.copy()
+                            self.settings_signal.emit(snap)
+                        if trig_state and trig_state != self._last_trig_state:
+                            self._last_trig_state = trig_state
+                            self.trig_state_signal.emit(trig_state)
                     except Exception:
                         pass
 
@@ -306,7 +377,7 @@ class _OscWorker(QThread):
 
     def stop(self) -> None:
         self._running = False
-        self._do_disconnect()
+        self._enqueue("__disconnect__", self._do_disconnect)
 
     # ── Internal ───────────────────────────────────────────────────────────────
 
@@ -348,8 +419,10 @@ class _OscWorker(QThread):
             self._osc = TDS2024C(resource)
             self._osc.connect()
             idn = self._osc.identify()
-            # Set the static waveform-transfer format once; live capture then
-            # only sends source + preamble + curve per frame.
+            # Configure the static waveform-transfer parameters once.
+            # After this, live capture only needs DATa:SOUrce + WFMPre? (cached)
+            # + CURVe? per frame.  Never call prepare_waveform_transfer again
+            # during normal operation — doing so invalidates the preamble cache.
             self._osc.prepare_waveform_transfer()
             self.connected_signal.emit(idn)
             self.log_signal.emit(f"Connected: {resource}")
@@ -380,8 +453,14 @@ class _OscWorker(QThread):
         if records:
             self.waveform_signal.emit(records)
 
-    def _build_state_snapshot(self) -> dict:
-        """Query ~20 scope settings for the bidirectional-sync poll."""
+    def _build_state_snapshot(self) -> tuple[dict, str]:
+        """Query scope settings and return (settings_dict, trig_state_str).
+
+        ``trig_state`` is returned *separately* so it can be excluded from the
+        settings equality check — a cycling trigger state would otherwise defeat
+        the "emit only when something changed" guard and call _on_settings every
+        poll tick.
+        """
         osc = self._osc
         snap: dict = {}
         snap["time_scale"] = osc.get_time_scale()
@@ -404,22 +483,24 @@ class _OscWorker(QThread):
             snap["trig_coupling"] = osc.get_trigger_coupling().value
         except Exception:
             pass
+        trig_state = ""
         try:
-            snap["trig_state"] = osc.get_trigger_state()
+            trig_state = osc.get_trigger_state()
         except Exception:
             pass
-        return snap
+        return snap, trig_state
 
     def _emit_settings_snapshot(self) -> None:
+        """Called once on connect / after autoset.  Primes the dedup cache."""
         if self._osc is None:
             return
         try:
-            snap = self._build_state_snapshot()
-            self._last_emitted_state = snap
+            snap, trig_state = self._build_state_snapshot()
+            self._last_emitted_state = snap.copy()
             self.settings_signal.emit(snap)
-            state = snap.get("trig_state", "")
-            if state:
-                self.trig_state_signal.emit(state)
+            if trig_state:
+                self._last_trig_state = trig_state
+                self.trig_state_signal.emit(trig_state)
         except Exception:
             pass
 
@@ -448,16 +529,16 @@ class TDS2024CGUI(QMainWindow):
         self._plot_curves: dict[Channel, pg.PlotDataItem] = {}
         self._ground_lines: dict[Channel, pg.InfiniteLine] = {}
         self._trig_line: Optional[pg.InfiniteLine] = None
-        self._vdiv_label = None   # pg.LabelItem
-        self._trig_badge = None   # pg.LabelItem
+        self._vdiv_label = None    # pg.LabelItem
+        self._trig_badge = None    # pg.LabelItem
         self._suppress_signals = False
 
-        # Per-channel state for plot scaling (updated from _on_settings)
+        # Per-channel state for divisions-based plot (updated from _on_settings)
         self._ch_v_per_div: dict[Channel, float] = {ch: 0.5 for ch in Channel.analog()}
-        self._ch_position: dict[Channel, float]  = {ch: 0.0 for ch in Channel.analog()}
-        self._trig_level_v   = 0.0
+        self._ch_position:  dict[Channel, float] = {ch: 0.0 for ch in Channel.analog()}
+        self._trig_level_v    = 0.0
         self._trig_source_str = "CH1"
-        self._time_scale_s   = 100e-6
+        self._time_scale_s    = 100e-6
 
         self._build_ui()
         self._set_connected(False)
@@ -470,7 +551,6 @@ class TDS2024CGUI(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setSpacing(4)
-
         root.addLayout(self._build_connection_bar())
 
         splitter = QSplitter(Qt.Horizontal)
@@ -543,7 +623,7 @@ class TDS2024CGUI(QMainWindow):
 
             scale_cb = QComboBox()
             scale_cb.addItems(_V_DIV_LABELS)
-            scale_cb.setCurrentIndex(7)  # default 500 mV/div
+            scale_cb.setCurrentIndex(7)   # 500 mV/div
             scale_cb.currentIndexChanged.connect(
                 lambda idx, c=ch: self._on_ch_scale_changed(c, idx)
             )
@@ -556,9 +636,10 @@ class TDS2024CGUI(QMainWindow):
             )
             col.addWidget(coup_cb)
 
-            # Single "On" checkbox: drives both scope display AND free-run capture
+            # Single "On" checkbox — single source of truth for both
+            # scope display (SELect:CH<n>) and free-run capture list.
             disp_cb = QCheckBox("On")
-            disp_cb.setChecked(i == 0)  # CH1 on by default
+            disp_cb.setChecked(i == 0)    # CH1 on by default
             disp_cb.stateChanged.connect(
                 lambda state, c=ch: self._on_ch_display_changed(c, state)
             )
@@ -580,7 +661,7 @@ class TDS2024CGUI(QMainWindow):
         layout.addWidget(QLabel("Time/div:"))
         self._time_scale_cb = QComboBox()
         self._time_scale_cb.addItems(_T_DIV_LABELS)
-        self._time_scale_cb.setCurrentIndex(13)  # default 100 µs/div
+        self._time_scale_cb.setCurrentIndex(13)   # 100 µs/div
         self._time_scale_cb.currentIndexChanged.connect(self._on_time_scale_changed)
         layout.addWidget(self._time_scale_cb)
 
@@ -592,7 +673,8 @@ class TDS2024CGUI(QMainWindow):
         layout = QHBoxLayout(box)
 
         self._acq_mode_cb = QComboBox()
-        self._acq_mode_cb.addItems(["Sample", "Peak", "Average"])
+        self._acq_mode_cb.addItems(_ACQ_MODE_DISPLAY)
+        self._acq_mode_cb.currentIndexChanged.connect(self._on_acq_mode_changed)
         layout.addWidget(self._acq_mode_cb)
 
         layout.addWidget(QLabel("Avg:"))
@@ -663,14 +745,13 @@ class TDS2024CGUI(QMainWindow):
 
         row2.addStretch()
         layout.addLayout(row2)
-
         return box
 
     def _build_plot_panel(self) -> QGroupBox:
         box = QGroupBox("Waveform")
         layout = QVBoxLayout(box)
 
-        # Plot controls — channel selection is unified in the Channel panel above
+        # Controls — channel selection is in the Channel panel (unified)
         ctrl = QHBoxLayout()
         self._btn_single = QPushButton("Single Shot")
         self._btn_single.clicked.connect(self._single_shot)
@@ -700,7 +781,6 @@ class TDS2024CGUI(QMainWindow):
         self._plot_widget.setYRange(-4.0, 4.0, padding=0)
         self._plot_widget.setLimits(yMin=-4.5, yMax=4.5)
 
-        # Per-channel waveform curves
         for i, ch in enumerate(Channel.analog()):
             curve = self._plot_widget.plot(
                 [], [], name=ch.value,
@@ -708,19 +788,19 @@ class TDS2024CGUI(QMainWindow):
             )
             self._plot_curves[ch] = curve
 
-        # Ground-reference lines: horizontal dashed line per channel at pos_div
+        # Ground-reference lines: dashed horizontal line at pos_div per channel
         for i, ch in enumerate(Channel.analog()):
             line = pg.InfiniteLine(
                 pos=0.0, angle=0,
-                pen=pg.mkPen(color=_CH_COLOURS[i], width=1.5,
-                             style=Qt.DashLine),
+                pen=pg.mkPen(color=_CH_COLOURS[i], width=1.5, style=Qt.DashLine),
                 movable=False,
             )
-            line.setVisible(False)
+            # Visibility mirrors the "On" checkbox default (CH1 on, rest off)
+            line.setVisible(i == 0)
             self._plot_widget.addItem(line)
             self._ground_lines[ch] = line
 
-        # Trigger-level line: horizontal dotted line in trigger-source colour
+        # Trigger-level line: dotted horizontal line in trigger-source colour
         self._trig_line = pg.InfiniteLine(
             pos=0.0, angle=0,
             pen=pg.mkPen(color=_CH_COLOURS[0], width=1, style=Qt.DotLine),
@@ -728,21 +808,22 @@ class TDS2024CGUI(QMainWindow):
         )
         self._plot_widget.addItem(self._trig_line)
 
-        # V/div label strip: bottom-left corner of the plot viewport
+        # V/div label strip: bottom-left corner of plot viewport
         self._vdiv_label = pg.LabelItem(text="", justify="left",
                                         color="#cccccc", size="8pt")
         self._vdiv_label.setParentItem(self._plot_widget.getPlotItem())
-        self._vdiv_label.anchor(itemPos=(0, 1), parentPos=(0, 1),
-                                offset=(5, -5))
+        self._vdiv_label.anchor(itemPos=(0, 1), parentPos=(0, 1), offset=(5, -5))
 
-        # Trigger-state badge: top-right corner of the plot viewport
+        # Trigger-state badge: top-right corner of plot viewport
         self._trig_badge = pg.LabelItem(text="---", justify="right",
                                         color="#4FC3F7", size="9pt")
         self._trig_badge.setParentItem(self._plot_widget.getPlotItem())
-        self._trig_badge.anchor(itemPos=(1, 0), parentPos=(1, 0),
-                                offset=(-5, 5))
+        self._trig_badge.anchor(itemPos=(1, 0), parentPos=(1, 0), offset=(-5, 5))
 
         layout.addWidget(self._plot_widget)
+
+        # Initialise labels now that the panel is constructed
+        self._update_vdiv_label()
         return box
 
     def _build_measurement_panel(self) -> QGroupBox:
@@ -780,12 +861,10 @@ class TDS2024CGUI(QMainWindow):
             "font-size: 20px; font-weight: bold; color: #FFD700; min-width: 160px;"
         )
         layout.addWidget(self._lbl_meas_value)
-
         layout.addStretch()
 
         self._meas_timer = QTimer()
         self._meas_timer.timeout.connect(self._do_measure)
-
         return box
 
     def _build_log_panel(self) -> QGroupBox:
@@ -802,7 +881,6 @@ class TDS2024CGUI(QMainWindow):
         btn_clear.setFixedWidth(50)
         btn_clear.clicked.connect(self._log_box.clear)
         layout.addWidget(btn_clear, alignment=Qt.AlignTop)
-
         return box
 
     # ── Slot handlers ──────────────────────────────────────────────────────────
@@ -817,8 +895,7 @@ class TDS2024CGUI(QMainWindow):
             self._on_log("No TDS2024C devices found on USB")
 
     def _connect(self):
-        resource = self._resource_combo.currentText().strip()
-        self._worker.cmd_connect(resource)
+        self._worker.cmd_connect(self._resource_combo.currentText().strip())
 
     def _disconnect(self):
         self._worker.cmd_disconnect()
@@ -837,32 +914,31 @@ class TDS2024CGUI(QMainWindow):
             self._worker.cmd_single_shot(channels)
 
     def _toggle_free_run(self, enabled: bool):
-        channels = self._active_channels()
-        interval = self._refresh_spin.value()
-        self._worker.cmd_set_free_run(enabled, channels, interval)
+        self._worker.cmd_set_free_run(enabled, self._active_channels(),
+                                      self._refresh_spin.value())
         self._btn_free_run.setText("■ Stop" if enabled else "▶ Free Run")
 
     def _do_measure(self):
-        src_text = self._meas_src_cb.currentText()
-        mtype    = self._meas_type_cb.currentData()
-        ch       = Channel(src_text)
+        ch    = Channel(self._meas_src_cb.currentText())
+        mtype = self._meas_type_cb.currentData()
         self._worker.cmd_measure(ch, mtype)
 
     def _toggle_continuous_meas(self, enabled: bool):
         if enabled:
-            interval_ms = int(self._meas_interval_spin.value() * 1000)
-            self._meas_timer.start(interval_ms)
+            self._meas_timer.start(int(self._meas_interval_spin.value() * 1000))
         else:
             self._meas_timer.stop()
+
+    # -- Per-channel --
 
     def _on_ch_scale_changed(self, ch: Channel, idx: int):
         if self._suppress_signals:
             return
-        v_per_div = _V_DIV_OPTIONS[idx]
-        self._ch_v_per_div[ch] = v_per_div
+        v = _V_DIV_OPTIONS[idx]
+        self._ch_v_per_div[ch] = v
         self._update_vdiv_label()
         self._update_trig_line()
-        self._worker.cmd_set_channel_scale(ch, v_per_div)
+        self._worker.cmd_set_channel_scale(ch, v)
 
     def _on_ch_coupling_changed(self, ch: Channel, text: str):
         if self._suppress_signals:
@@ -874,15 +950,15 @@ class TDS2024CGUI(QMainWindow):
             return
         on = bool(state)
         self._worker.cmd_set_channel_display(ch, on)
-        # Sync ground-ref line visibility
         if ch in self._ground_lines:
             self._ground_lines[ch].setVisible(on)
         self._update_vdiv_label()
-        # Update free-run capture list if running
+        # Keep free-run capture list in sync with the checkbox state
         if self._btn_free_run.isChecked():
-            self._worker.cmd_set_free_run(
-                True, self._active_channels(), self._refresh_spin.value()
-            )
+            self._worker.cmd_set_free_run(True, self._active_channels(),
+                                          self._refresh_spin.value())
+
+    # -- Horizontal --
 
     def _on_time_scale_changed(self, idx: int):
         if self._suppress_signals:
@@ -891,16 +967,28 @@ class TDS2024CGUI(QMainWindow):
         self._update_vdiv_label()
         self._worker.cmd_set_time_scale(_T_DIV_OPTIONS[idx])
 
+    # -- Acquisition --
+
+    def _on_acq_mode_changed(self, idx: int):
+        if self._suppress_signals:
+            return
+        mode = _ACQ_MODE_ENUM[idx]
+        numavg = self._avg_spin.value()
+        self._worker.cmd_set_acq_mode(mode, numavg)
+
+    # -- Trigger --
+
     def _on_trig_source_changed(self, text: str):
         if self._suppress_signals:
             return
         self._trig_source_str = text
         self._update_trig_line_color()
         self._update_trig_line()
-        try:
-            self._worker.cmd_set_trigger_source(TriggerSource(text))
-        except ValueError:
-            pass
+        ts = TriggerSource(text)   # _ScpiEnum._missing_ returns None on bad input
+        if ts is not None:
+            self._worker.cmd_set_trigger_source(ts)
+        else:
+            self._on_log(f"WARN: unknown trigger source '{text}' — ignored")
 
     def _on_trig_level_changed(self, value: float):
         if self._suppress_signals:
@@ -924,11 +1012,9 @@ class TDS2024CGUI(QMainWindow):
     def _on_trig_coupling_changed(self, text: str):
         if self._suppress_signals:
             return
-        try:
-            idx = _TRIG_COUP_DISPLAY.index(text)
-            self._worker.cmd_set_trigger_coupling(_TRIG_COUP_ENUM[idx])
-        except (ValueError, IndexError):
-            pass
+        coupling = _TRIG_COUP_BY_LABEL.get(text)
+        if coupling is not None:
+            self._worker.cmd_set_trigger_coupling(coupling)
 
     # ── Worker signals → GUI ───────────────────────────────────────────────────
 
@@ -948,14 +1034,10 @@ class TDS2024CGUI(QMainWindow):
                 continue
             v_per_div = self._ch_v_per_div.get(ch, 0.5)
             pos_div   = self._ch_position.get(ch, 0.0)
-            if v_per_div > 0:
-                y_div = rec.v / v_per_div + pos_div
-            else:
-                y_div = np.zeros_like(rec.v)
+            y_div = rec.v / v_per_div + pos_div if v_per_div > 0 else np.zeros_like(rec.v)
             self._plot_curves[ch].setData(rec.t, y_div)
 
     def _on_measurement(self, value: float, units: str, type_name: str):
-        import math
         if math.isnan(value):
             self._lbl_meas_value.setText("---")
             self._lbl_meas_value.setStyleSheet(
@@ -976,14 +1058,18 @@ class TDS2024CGUI(QMainWindow):
             )
 
     def _on_settings(self, snap: dict):
-        """Apply a scope-state snapshot to all widgets (device → GUI direction)."""
+        """Apply a scope-state snapshot to all widgets (device → GUI direction).
+
+        Called from the worker's settings_signal — does NOT contain trig_state
+        (that comes via trig_state_signal on its own faster schedule).
+        """
         self._suppress_signals = True
         try:
             if "time_scale" in snap:
                 val = snap["time_scale"]
                 self._time_scale_s = val
-                idx = min(range(len(_T_DIV_OPTIONS)),
-                          key=lambda i: abs(_T_DIV_OPTIONS[i] - val))
+                # Use pre-built lookup; fall back to closest match for non-standard values
+                idx = _T_DIV_INDEX.get(val, _closest_index(_T_DIV_OPTIONS, val))
                 self._time_scale_cb.setCurrentIndex(idx)
 
             for ch in Channel.analog():
@@ -993,8 +1079,7 @@ class TDS2024CGUI(QMainWindow):
                 if scale_key in snap:
                     val = snap[scale_key]
                     self._ch_v_per_div[ch] = val
-                    idx = min(range(len(_V_DIV_OPTIONS)),
-                              key=lambda i: abs(_V_DIV_OPTIONS[i] - val))
+                    idx = _V_DIV_INDEX.get(val, _closest_index(_V_DIV_OPTIONS, val))
                     w["scale"].setCurrentIndex(idx)
 
                 pos_key = f"{ch.value}_position"
@@ -1050,6 +1135,15 @@ class TDS2024CGUI(QMainWindow):
         finally:
             self._suppress_signals = False
 
+        # After syncing display states, refresh the worker's free-run capture
+        # list.  This is necessary because setChecked() above is suppressed and
+        # cannot call _on_ch_display_changed, so if a channel was toggled via
+        # the scope's front-panel button the worker would keep capturing the
+        # stale channel list.
+        if self._btn_free_run.isChecked():
+            self._worker.cmd_set_free_run(True, self._active_channels(),
+                                          self._refresh_spin.value())
+
         self._update_trig_line()
         self._update_vdiv_label()
 
@@ -1057,32 +1151,18 @@ class TDS2024CGUI(QMainWindow):
         self._log_box.appendPlainText(msg)
 
     def _on_trig_state(self, state: str):
-        _colours = {
-            "ARMED":   "#FFA500",
-            "AUTO":    "#4FC3F7",
-            "READY":   "#66BB6A",
-            "SAVE":    "#CE93D8",
-            "TRIGGER": "#FFD700",
-        }
-        colour = _colours.get(state.upper(), "gray")
-        self._lbl_trig_state.setStyleSheet(
-            f"color: {colour}; font-size: 18px;"
-        )
+        colour = _TRIG_STATE_COLOURS.get(state.upper(), "gray")
+        self._lbl_trig_state.setStyleSheet(f"color: {colour}; font-size: 18px;")
         self._lbl_trig_state.setToolTip(state)
         if self._trig_badge is not None:
-            _labels = {
-                "ARMED": "ARMED", "AUTO": "AUTO", "READY": "READY",
-                "SAVE": "SAVE", "TRIGGER": "TRIG'D",
-            }
-            label = _labels.get(state.upper(), state)
+            label = _TRIG_STATE_LABELS.get(state.upper(), state)
             self._trig_badge.setText(label, color=colour, size="9pt")
 
     # ── Plot overlay helpers ───────────────────────────────────────────────────
 
     def _trig_source_colour(self) -> str:
-        src = self._trig_source_str.upper()
-        _idx = {"CH1": 0, "CH2": 1, "CH3": 2, "CH4": 3}
-        return _CH_COLOURS[_idx[src]] if src in _idx else "#FFFFFF"
+        idx = _CH_IDX.get(self._trig_source_str.upper())
+        return _CH_COLOURS[idx] if idx is not None else "#FFFFFF"
 
     def _update_trig_line_color(self):
         if self._trig_line is None:
@@ -1092,45 +1172,43 @@ class TDS2024CGUI(QMainWindow):
         )
 
     def _update_trig_line(self):
-        """Reposition the trigger-level line in division units."""
+        """Reposition (and show/hide) the trigger-level line in division units."""
         if self._trig_line is None:
             return
         src = self._trig_source_str.upper()
         _ch_map = {"CH1": Channel.CH1, "CH2": Channel.CH2,
                    "CH3": Channel.CH3, "CH4": Channel.CH4}
         if src in _ch_map:
-            ch = _ch_map[src]
+            ch        = _ch_map[src]
             v_per_div = self._ch_v_per_div.get(ch, 0.5)
             pos_div   = self._ch_position.get(ch, 0.0)
             trig_div  = (self._trig_level_v / v_per_div + pos_div
                          if v_per_div > 0 else 0.0)
+            self._trig_line.setPos(trig_div)
+            self._trig_line.setVisible(True)
         else:
-            trig_div = 0.0
-        self._trig_line.setPos(trig_div)
+            # EXT / EXT5 / LINE — no channel voltage reference; hide the line
+            self._trig_line.setVisible(False)
 
     def _update_vdiv_label(self):
-        """Refresh the per-channel V/div + time/div text strip."""
+        """Refresh the per-channel V/div + time/div text strip (bottom-left)."""
         if self._vdiv_label is None:
             return
         parts = []
         for i, ch in enumerate(Channel.analog()):
             if self._ch_widgets[ch]["display"].isChecked():
-                v = self._ch_v_per_div.get(ch, 0.5)
-                parts.append(f"{ch.value}: {_eng_v(v)}")
+                parts.append(f"{ch.value}: {_eng_v(self._ch_v_per_div.get(ch, 0.5))}")
         parts.append(_eng_t(self._time_scale_s))
         self._vdiv_label.setText("   ".join(parts))
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
     def _set_connected(self, connected: bool):
+        for btn in (self._btn_single, self._btn_free_run, self._btn_autoset,
+                    self._btn_measure, self._btn_force_trig, self._btn_set_50pct):
+            btn.setEnabled(connected)
         self._btn_connect.setEnabled(not connected)
         self._btn_disconnect.setEnabled(connected)
-        self._btn_single.setEnabled(connected)
-        self._btn_free_run.setEnabled(connected)
-        self._btn_autoset.setEnabled(connected)
-        self._btn_measure.setEnabled(connected)
-        self._btn_force_trig.setEnabled(connected)
-        self._btn_set_50pct.setEnabled(connected)
         if connected:
             self._lbl_status.setText("● Connected")
             self._lbl_status.setStyleSheet("color: #66BB6A; font-weight: bold;")
