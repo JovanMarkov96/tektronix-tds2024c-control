@@ -13,9 +13,22 @@ from tektronix_tds2024c.models import Channel
 
 
 # Real header-off WFMPre? response captured from a TDS2024C (FV:v24.26)
+# Channel position = 0 so YZERO=0.0 and YOFF=0.0 — both are zero here.
 _REAL_WFMPRE = (
     '1;8;BIN;RI;MSB;2500;"Ch1, DC coupling, 2.0E-2 V/div, 2.5E-9 s/div, '
     '2500 points, Sample mode";Y;1.0E-11;0;-1.25E-8;"s";8.0E-4;0.0E0;0.0E0;"Volts"'
+)
+
+# Real header-off WFMPre? response at 200 mV/div with CH1 position = +2.0 div.
+# YOFF is non-zero here (50 ADC counts), which is the case that exposes the
+# field-13/14 swap bug.  Field order from TDS2000B Table B-1:
+#   … YMULT; YZERO; YOFF; YUNIT
+#         12;    13;   14;    15
+# YZERO (field 13) = 0.0E0 = reference voltage (zero volts)
+# YOFF  (field 14) = 5.0E1 = ADC count that maps to YZERO (changes with position)
+_REAL_WFMPRE_POS = (
+    '1;8;BIN;RI;MSB;2500;"Ch1, DC coupling, 2.0E-1 V/div, 5.0E-7 s/div, '
+    '2500 points, Sample mode";Y;2.0E-9;0;-2.5E-6;"s";8.0E-3;0.0E0;5.0E1;"Volts"'
 )
 
 
@@ -86,6 +99,31 @@ def test_positional_wfid_with_commas_does_not_break_fields():
 def test_positional_too_few_fields_raises():
     with pytest.raises(ValueError):
         WaveformPreamble.from_response("1;8;BIN;RI;MSB")
+
+
+def test_positional_yzero_yoff_field_order():
+    """Field 13 = YZERO, field 14 = YOFF (TDS2000B Table B-1 order).
+
+    This is the *opposite* of alphabetical order.  The bug being guarded
+    against is swapping the two assignments, which causes decoded voltages
+    to be ~200× wrong when the channel position is non-zero (YOFF != 0).
+
+    _REAL_WFMPRE_POS is captured at 200 mV/div with CH1 position = +2.0 div
+    so YOFF = 50 ADC counts and YZERO = 0.0 V.
+    """
+    p = WaveformPreamble.from_response(_REAL_WFMPRE_POS)
+    assert p.y_mult  == pytest.approx(8e-3)
+    assert p.y_zero  == pytest.approx(0.0),  "field 13 is YZERO (reference voltage)"
+    assert p.y_off   == pytest.approx(50.0), "field 14 is YOFF (ADC count for YZERO)"
+    # With YOFF=50, ADC=50 must decode to exactly 0 V
+    adc = np.array([50.0])
+    v = (adc - p.y_off) * p.y_mult + p.y_zero
+    assert abs(v[0]) < 1e-10, f"ADC=50 should give 0 V, got {v[0]!r} V"
+    # 500 mVpp sine: ADC spans roughly [19, 81]; voltages ≈ ±0.248 V
+    adc_range = np.array([19.0, 81.0])
+    v_range = (adc_range - p.y_off) * p.y_mult + p.y_zero
+    assert v_range[0] == pytest.approx(-0.248, abs=0.01)
+    assert v_range[1] == pytest.approx( 0.248, abs=0.01)
 
 
 # ── WFMPre? header-on (KEY value) — fallback format ────────────────────────────

@@ -18,11 +18,16 @@ class WaveformPreamble:
     * **HEADer OFF** (this driver's default) — positional, semicolon-separated
       values with no field names::
 
-          1;8;BIN;RI;MSB;2500;"Ch1, ...";Y;1.0E-11;0;-1.25E-8;"s";8.0E-4;0;0;"Volts"
+          1;8;BIN;RI;MSB;2500;"Ch1, ...";Y;2.0E-9;0;-2.5E-6;"s";8.0E-3;0.0E0;5.0E1;"Volts"
 
-      Field order (16 fields):
+      Field order (16 fields, as returned by TDS2000B firmware — Table B-1):
       BYT_NR; BIT_NR; ENCDG; BN_FMT; BYT_OR; NR_PT; WFID; PT_FMT;
-      XINCR; PT_OFF; XZERO; XUNIT; YMULT; YOFF; YZERO; YUNIT
+      XINCR; PT_OFF; XZERO; XUNIT; YMULT; YZERO; YOFF; YUNIT
+
+      Note the order: **YZERO (field 13) comes before YOFF (field 14)**.
+      This is the opposite of the alphabetical order and a common source of
+      confusion.  YZERO is the reference voltage (usually 0 V); YOFF is the
+      ADC count that maps to YZERO (changes with CH<n>:POSition).
 
     * **HEADer ON** — ``KEY value;KEY value;...`` pairs.
 
@@ -95,8 +100,8 @@ class WaveformPreamble:
             x_zero     = _f(10, 0.0),
             x_unit     = _s(11, "s"),
             y_mult     = _f(12, 1.0),
-            y_off      = _f(13, 0.0),
-            y_zero     = _f(14, 0.0),
+            y_zero     = _f(13, 0.0),   # field 13 = YZERO (reference voltage, V)
+            y_off      = _f(14, 0.0),   # field 14 = YOFF  (ADC count for YZERO)
             y_unit     = _s(15, "V"),
         )
 
