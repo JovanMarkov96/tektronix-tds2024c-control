@@ -540,6 +540,11 @@ class TDS2024CGUI(QMainWindow):
         self._trig_source_str = "CH1"
         self._time_scale_s    = 100e-6
 
+        # Auto-free-run flag: set True after auto-connect so that the first
+        # settings snapshot (from _do_connect → _emit_settings_snapshot) triggers
+        # free run automatically.  Cleared on first use.
+        self._pending_auto_free_run = False
+
         self._build_ui()
         self._set_connected(False)
         self._discover()
@@ -891,6 +896,13 @@ class TDS2024CGUI(QMainWindow):
         if resources:
             self._resource_combo.addItems(resources)
             self._on_log(f"Found {len(resources)} device(s)")
+            # Auto-connect if there is exactly one scope on the bus.
+            # The flag triggers auto-free-run once the first settings snapshot
+            # arrives (see _on_settings).
+            if len(resources) == 1:
+                self._on_log("Auto-connecting to single device …")
+                self._pending_auto_free_run = True
+                self._worker.cmd_connect(resources[0])
         else:
             self._on_log("No TDS2024C devices found on USB")
 
@@ -1143,6 +1155,14 @@ class TDS2024CGUI(QMainWindow):
         if self._btn_free_run.isChecked():
             self._worker.cmd_set_free_run(True, self._active_channels(),
                                           self._refresh_spin.value())
+
+        # Auto-start free run on first settings snapshot after auto-connect.
+        # We wait for the snapshot (rather than acting in _on_connected) so that
+        # _ch_v_per_div / _ch_position are already populated before waveforms
+        # start arriving, giving correct division-based scaling from frame one.
+        if self._pending_auto_free_run:
+            self._pending_auto_free_run = False
+            self._btn_free_run.setChecked(True)   # triggers _toggle_free_run
 
         self._update_trig_line()
         self._update_vdiv_label()
