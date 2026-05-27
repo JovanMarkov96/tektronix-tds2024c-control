@@ -179,6 +179,10 @@ class _OscWorker(QThread):
         self._last_trig_poll = 0.0
         self._last_emitted_state: dict = {}
         self._last_trig_state = ""
+        # Preamble refresh flag: set True when free-run starts so the first
+        # capture re-reads WFMPre? for all channels (picks up any front-panel
+        # V/div / time-base changes made while the scope was idle).
+        self._free_run_needs_preamble_refresh = False
 
     # ── Public API (called from GUI thread) ────────────────────────────────────
 
@@ -213,9 +217,21 @@ class _OscWorker(QThread):
                          interval_ms: int) -> None:
         # Set _free_run last so the worker never sees enabled=True with
         # the old channel list (avoids a benign CPython GIL-window race).
+        was_running = self._free_run
         self._free_run_channels = channels
         self._free_run_interval_ms = interval_ms
         self._free_run = enabled
+
+        if enabled and not was_running:
+            # Starting free-run: force a preamble refresh on the first capture
+            # so any V/div / timebase changes made from the scope front panel
+            # while idle are reflected immediately from frame one.
+            self._free_run_needs_preamble_refresh = True
+
+        if not enabled and was_running:
+            # Stopping free-run: reset poll timer so the full settings snapshot
+            # fires on the very next idle loop iteration (immediate GUI sync).
+            self._last_settings_poll = 0.0
 
     def cmd_measure(self, ch: Channel, mtype: MeasType) -> None:
         def _do():
@@ -355,23 +371,30 @@ class _OscWorker(QThread):
                     except Exception:
                         pass
 
-                # ── Full settings poll ────────────────────────────────────────
-                # Longer interval during free-run so the ~20 VISA queries don't
-                # block waveform capture for a full second every 750 ms.
-                settings_interval = (3.0 if self._free_run
-                                     else self._state_poll_interval_ms / 1000.0)
-                if now - self._last_settings_poll >= settings_interval:
-                    self._last_settings_poll = now
-                    try:
-                        snap, trig_state = self._build_state_snapshot()
-                        if snap != self._last_emitted_state:
-                            self._last_emitted_state = snap.copy()
-                            self.settings_signal.emit(snap)
-                        if trig_state and trig_state != self._last_trig_state:
-                            self._last_trig_state = trig_state
-                            self.trig_state_signal.emit(trig_state)
-                    except Exception:
-                        pass
+                # ── Full settings poll (idle only) ────────────────────────────
+                # The full snapshot sends ~23 VISA queries and takes ~1 s on
+                # the TDS2024C.  Running it during free-run would block capture
+                # for 1 s every few seconds — unacceptable.  Instead:
+                #
+                #   • During FREE-RUN: poll is suppressed entirely.  The
+                #     trig-state badge above covers the only fast-changing value.
+                #     When the user stops free-run, cmd_set_free_run resets
+                #     _last_settings_poll to 0 so the sync fires immediately.
+                #
+                #   • During IDLE: poll every 750 ms for fast device→GUI sync.
+                if not self._free_run:
+                    if now - self._last_settings_poll >= self._state_poll_interval_ms / 1000.0:
+                        self._last_settings_poll = now
+                        try:
+                            snap, trig_state = self._build_state_snapshot()
+                            if snap != self._last_emitted_state:
+                                self._last_emitted_state = snap.copy()
+                                self.settings_signal.emit(snap)
+                            if trig_state and trig_state != self._last_trig_state:
+                                self._last_trig_state = trig_state
+                                self.trig_state_signal.emit(trig_state)
+                        except Exception:
+                            pass
 
             self.msleep(5)
 
@@ -444,10 +467,16 @@ class _OscWorker(QThread):
         self.log_signal.emit("Disconnected")
 
     def _do_free_run_capture(self) -> None:
+        # Consume the one-shot preamble-refresh flag.  True only on the first
+        # frame after free-run starts, ensuring V/div / timebase changes made
+        # from the scope front panel while idle are picked up immediately.
+        refresh = self._free_run_needs_preamble_refresh
+        self._free_run_needs_preamble_refresh = False
+
         records = {}
         for ch in self._free_run_channels:
             try:
-                records[ch] = self._osc.read_waveform(ch)  # fast path (format preset)
+                records[ch] = self._osc.read_waveform(ch, refresh_preamble=refresh)
             except Exception:
                 pass
         if records:
@@ -497,6 +526,9 @@ class _OscWorker(QThread):
         try:
             snap, trig_state = self._build_state_snapshot()
             self._last_emitted_state = snap.copy()
+            # Stamp the poll clock so the idle loop does not immediately fire
+            # another full settings query right after connect/autoset.
+            self._last_settings_poll = time.monotonic()
             self.settings_signal.emit(snap)
             if trig_state:
                 self._last_trig_state = trig_state
