@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tektronix-tds2024c-control"
+version = "0.1.0"
+description = "Python driver and GUI for the Tektronix TDS2024C (TDS2000B family) digital storage oscilloscope"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.8"
+keywords = ["oscilloscope", "tektronix", "SCPI", "VISA", "TDS2024C", "TDS2000B", "instrument", "usbtmc"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "pyvisa>=1.12",
+    "pyvisa-py>=0.5",
+    "numpy>=1.20",
+]
+
+[project.optional-dependencies]
+gui = ["qtpy>=2.0", "pyqtgraph>=0.13", "PyQt5>=5.15"]
+dev = ["pytest>=7.0", "qtpy>=2.0", "pyqtgraph>=0.13", "PyQt5>=5.15"]
+
+[project.scripts]
+tds2024c-gui = "tektronix_tds2024c.gui_app:main"
+
+[project.urls]
+Homepage = "https://github.com/JovanMarkov96/tektronix-tds2024c-control"
+"Bug Tracker" = "https://github.com/JovanMarkov96/tektronix-tds2024c-control/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+pythonpath = ["src"]
+markers = [
+    "hardware: test requires a physically connected Tektronix scope (auto-skips if none found)",
+]
