@@ -28,6 +28,7 @@ try:
         QComboBox,
         QDoubleSpinBox,
         QFileDialog,
+        QFrame,
         QGroupBox,
         QHBoxLayout,
         QLabel,
@@ -230,7 +231,8 @@ class _OscWorker(QThread):
     connected_signal    = Signal(str)
     disconnected_signal = Signal()
     waveform_signal     = Signal(object)           # dict[Channel, WaveformRecord]
-    measurement_signal  = Signal(float, str, str)  # value, units, type_name
+    measurement_signal    = Signal(float, str, str)     # value, units, type_name (legacy)
+    measurement_ex_signal = Signal(float, str, str, int) # value, units, type_name, slot_idx
     settings_signal     = Signal(dict)             # scope settings snapshot (no trig_state)
     log_signal          = Signal(str)
     trig_state_signal   = Signal(str)              # separate — high-frequency badge updates
@@ -314,6 +316,18 @@ class _OscWorker(QThread):
             except TDS2024CMeasurementError:
                 self.measurement_signal.emit(float("nan"), "", mtype.value)
         self._enqueue("measure", _do)
+
+    def cmd_measure_ex(self, ch: Channel, mtype: MeasType, slot_idx: int) -> None:
+        """Measure one slot and emit measurement_ex_signal with the slot index."""
+        def _do():
+            assert self._osc
+            try:
+                val = self._osc.measure(ch, mtype)
+                units = self._osc.get_immed_units()
+                self.measurement_ex_signal.emit(val, units, mtype.value, slot_idx)
+            except TDS2024CMeasurementError:
+                self.measurement_ex_signal.emit(float("nan"), "", mtype.value, slot_idx)
+        self._enqueue(f"measure_ex_{slot_idx}", _do)
 
     def cmd_autoset(self) -> None:
         def _do():
@@ -665,7 +679,7 @@ class TDS2024CGUI(QMainWindow):
         self._worker.connected_signal.connect(self._on_connected)
         self._worker.disconnected_signal.connect(self._on_disconnected)
         self._worker.waveform_signal.connect(self._on_waveform)
-        self._worker.measurement_signal.connect(self._on_measurement)
+        self._worker.measurement_ex_signal.connect(self._on_measurement_ex)
         self._worker.settings_signal.connect(self._on_settings)
         self._worker.log_signal.connect(self._on_log)
         self._worker.trig_state_signal.connect(self._on_trig_state)
@@ -1030,41 +1044,74 @@ class TDS2024CGUI(QMainWindow):
         return box
 
     def _build_measurement_panel(self) -> QGroupBox:
-        box = QGroupBox("Measurement")
-        layout = QHBoxLayout(box)
+        """5-slot simultaneous measurement bar."""
+        box = QGroupBox("Measurements")
+        outer = QVBoxLayout(box)
+        outer.setSpacing(3)
 
-        layout.addWidget(QLabel("Src:"))
-        self._meas_src_cb = QComboBox()
-        self._meas_src_cb.addItems(["CH1", "CH2", "CH3", "CH4"])
-        layout.addWidget(self._meas_src_cb)
+        # ── 5 measurement slots ────────────────────────────────────────────
+        slots_row = QHBoxLayout()
+        slots_row.setSpacing(2)
+        self._meas_slot_widgets = []  # (active_cb, src_combo, type_combo, lbl_value)
 
-        layout.addWidget(QLabel("Type:"))
-        self._meas_type_cb = QComboBox()
-        for m in MeasType:
-            self._meas_type_cb.addItem(m.name, m)
-        layout.addWidget(self._meas_type_cb)
+        for i in range(5):
+            col = QVBoxLayout()
+            col.setSpacing(2)
 
-        self._btn_measure = QPushButton("Measure")
+            active_cb = QCheckBox()
+            active_cb.setChecked(i == 0)
+            active_cb.setToolTip(f"Enable slot {i+1}")
+            col.addWidget(active_cb, alignment=Qt.AlignHCenter)
+
+            src_cb = QComboBox()
+            src_cb.addItems(["CH1", "CH2", "CH3", "CH4"])
+            src_cb.setMaximumWidth(58)
+            col.addWidget(src_cb)
+
+            type_cb = QComboBox()
+            for m in MeasType:
+                type_cb.addItem(m.name, m)
+            type_cb.setMaximumWidth(75)
+            col.addWidget(type_cb)
+
+            lbl = QLabel("---")
+            lbl.setStyleSheet(
+                "font-size: 11px; font-weight: bold; color: #FFD700;"
+                " min-width: 95px; qproperty-alignment: AlignCenter;"
+            )
+            lbl.setAlignment(Qt.AlignCenter)
+            col.addWidget(lbl)
+
+            self._meas_slot_widgets.append((active_cb, src_cb, type_cb, lbl))
+            slots_row.addLayout(col)
+
+            if i < 4:
+                sep = QFrame()
+                sep.setFrameShape(QFrame.VLine)
+                sep.setFrameShadow(QFrame.Sunken)
+                slots_row.addWidget(sep)
+
+        outer.addLayout(slots_row)
+
+        # ── Controls row ──────────────────────────────────────────────────
+        ctrl = QHBoxLayout()
+        self._btn_measure = QPushButton("Run")
         self._btn_measure.clicked.connect(self._do_measure)
-        layout.addWidget(self._btn_measure)
+        ctrl.addWidget(self._btn_measure)
 
         self._cb_continuous = QCheckBox("Continuous")
         self._cb_continuous.toggled.connect(self._toggle_continuous_meas)
-        layout.addWidget(self._cb_continuous)
+        ctrl.addWidget(self._cb_continuous)
 
-        layout.addWidget(QLabel("Interval:"))
+        ctrl.addWidget(QLabel("Rate:"))
         self._meas_interval_spin = QDoubleSpinBox()
         self._meas_interval_spin.setRange(0.5, 60.0)
         self._meas_interval_spin.setValue(1.0)
         self._meas_interval_spin.setSuffix(" s")
-        layout.addWidget(self._meas_interval_spin)
+        ctrl.addWidget(self._meas_interval_spin)
+        ctrl.addStretch()
 
-        self._lbl_meas_value = QLabel("---")
-        self._lbl_meas_value.setStyleSheet(
-            "font-size: 20px; font-weight: bold; color: #FFD700; min-width: 160px;"
-        )
-        layout.addWidget(self._lbl_meas_value)
-        layout.addStretch()
+        outer.addLayout(ctrl)
 
         self._meas_timer = QTimer()
         self._meas_timer.timeout.connect(self._do_measure)
@@ -1155,9 +1202,12 @@ class TDS2024CGUI(QMainWindow):
             self._btn_scope_run.setText("▶ Run Scope")
 
     def _do_measure(self):
-        ch    = Channel(self._meas_src_cb.currentText())
-        mtype = self._meas_type_cb.currentData()
-        self._worker.cmd_measure(ch, mtype)
+        """Trigger measurements for all active slots."""
+        for i, (active_cb, src_cb, type_cb, _) in enumerate(self._meas_slot_widgets):
+            if active_cb.isChecked():
+                ch    = Channel(src_cb.currentText())
+                mtype = type_cb.currentData()
+                self._worker.cmd_measure_ex(ch, mtype, i)
 
     def _toggle_continuous_meas(self, enabled: bool):
         if enabled:
@@ -1296,11 +1346,16 @@ class TDS2024CGUI(QMainWindow):
             y_div = rec.v / v_per_div + pos_div if v_per_div > 0 else np.zeros_like(rec.v)
             self._plot_curves[ch].setData(rec.t, y_div)
 
-    def _on_measurement(self, value: float, units: str, type_name: str):
+    def _on_measurement_ex(self, value: float, units: str, type_name: str,
+                           slot_idx: int):
+        if slot_idx >= len(self._meas_slot_widgets):
+            return
+        lbl = self._meas_slot_widgets[slot_idx][3]
         if math.isnan(value):
-            self._lbl_meas_value.setText("---")
-            self._lbl_meas_value.setStyleSheet(
-                "font-size: 20px; font-weight: bold; color: #FF6B6B;"
+            lbl.setText("---")
+            lbl.setStyleSheet(
+                "font-size: 11px; font-weight: bold; color: #FF6B6B;"
+                " min-width: 95px; qproperty-alignment: AlignCenter;"
             )
         else:
             if "Hz" in units and value >= 1e6:
@@ -1311,9 +1366,10 @@ class TDS2024CGUI(QMainWindow):
                 display = f"{value*1e3:.3f} mV"
             else:
                 display = f"{value:.5g} {units}"
-            self._lbl_meas_value.setText(display)
-            self._lbl_meas_value.setStyleSheet(
-                "font-size: 20px; font-weight: bold; color: #FFD700;"
+            lbl.setText(display)
+            lbl.setStyleSheet(
+                "font-size: 11px; font-weight: bold; color: #FFD700;"
+                " min-width: 95px; qproperty-alignment: AlignCenter;"
             )
 
     def _on_settings(self, snap: dict):
