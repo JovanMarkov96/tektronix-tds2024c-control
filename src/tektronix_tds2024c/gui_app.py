@@ -255,6 +255,25 @@ class _OscWorker(QThread):
             self._emit_settings_snapshot()
         self._enqueue("autoset", _do)
 
+    def cmd_acq_run(self) -> None:
+        def _do():
+            assert self._osc
+            self._osc.acq_run()
+        self._enqueue("acq_run", _do)
+
+    def cmd_acq_stop(self) -> None:
+        def _do():
+            assert self._osc
+            self._osc.acq_stop()
+        self._enqueue("acq_stop", _do)
+
+    def cmd_default_setup(self) -> None:
+        def _do():
+            assert self._osc
+            self._osc.reset()
+            self._emit_settings_snapshot()
+        self._enqueue("default_setup", _do)
+
     def cmd_set_channel_scale(self, ch: Channel, v_per_div: float) -> None:
         def _do():
             assert self._osc
@@ -662,6 +681,16 @@ class TDS2024CGUI(QMainWindow):
         self._btn_disconnect.clicked.connect(self._disconnect)
         layout.addWidget(self._btn_disconnect)
 
+        self._btn_scope_run = QPushButton("⏸ Stop Scope")
+        self._btn_scope_run.setCheckable(True)
+        self._btn_scope_run.setChecked(True)   # scope running on connect
+        self._btn_scope_run.toggled.connect(self._toggle_scope_run)
+        layout.addWidget(self._btn_scope_run)
+
+        self._btn_autoset = QPushButton("AutoSet")
+        self._btn_autoset.clicked.connect(self._autoset)
+        layout.addWidget(self._btn_autoset)
+
         self._lbl_status = QLabel("● Disconnected")
         self._lbl_status.setStyleSheet("color: #FF6B6B; font-weight: bold;")
         layout.addWidget(self._lbl_status)
@@ -772,9 +801,9 @@ class TDS2024CGUI(QMainWindow):
         self._avg_spin.setSingleStep(4)
         layout.addWidget(self._avg_spin)
 
-        self._btn_autoset = QPushButton("AutoSet")
-        self._btn_autoset.clicked.connect(self._autoset)
-        layout.addWidget(self._btn_autoset)
+        self._btn_default_setup = QPushButton("Default Setup")
+        self._btn_default_setup.clicked.connect(lambda: self._worker.cmd_default_setup())
+        layout.addWidget(self._btn_default_setup)
 
         layout.addStretch()
         return box
@@ -1015,6 +1044,18 @@ class TDS2024CGUI(QMainWindow):
         self._worker.cmd_set_free_run(enabled, self._active_channels(),
                                       self._refresh_spin.value())
         self._btn_free_run.setText("■ Stop" if enabled else "▶ Free Run")
+
+    def _toggle_scope_run(self, checked: bool):
+        # checked=True: button is now in the checked/active state; the button
+        # started checked=True ("⏸ Stop Scope"), so toggled(True) fires when
+        # the scope transitions BACK to running (user clicked "▶ Run Scope").
+        # toggled(False) fires when user clicked "⏸ Stop Scope" to stop it.
+        if checked:
+            self._worker.cmd_acq_run()
+            self._btn_scope_run.setText("⏸ Stop Scope")
+        else:
+            self._worker.cmd_acq_stop()
+            self._btn_scope_run.setText("▶ Run Scope")
 
     def _do_measure(self):
         ch    = Channel(self._meas_src_cb.currentText())
@@ -1364,7 +1405,8 @@ class TDS2024CGUI(QMainWindow):
 
     def _set_connected(self, connected: bool):
         for btn in (self._btn_single, self._btn_free_run, self._btn_autoset,
-                    self._btn_measure, self._btn_force_trig, self._btn_set_50pct):
+                    self._btn_measure, self._btn_force_trig, self._btn_set_50pct,
+                    self._btn_scope_run, self._btn_default_setup):
             btn.setEnabled(connected)
         self._btn_connect.setEnabled(not connected)
         self._btn_disconnect.setEnabled(connected)
