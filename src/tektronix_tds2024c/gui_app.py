@@ -27,6 +27,7 @@ try:
         QCheckBox,
         QComboBox,
         QDoubleSpinBox,
+        QFileDialog,
         QGroupBox,
         QHBoxLayout,
         QLabel,
@@ -747,6 +748,10 @@ class TDS2024CGUI(QMainWindow):
         self._btn_autoset.clicked.connect(self._autoset)
         layout.addWidget(self._btn_autoset)
 
+        self._btn_save_image = QPushButton("Save Image")
+        self._btn_save_image.clicked.connect(self._save_screenshot)
+        layout.addWidget(self._btn_save_image)
+
         self._lbl_status = QLabel("● Disconnected")
         self._lbl_status.setStyleSheet("color: #FF6B6B; font-weight: bold;")
         layout.addWidget(self._lbl_status)
@@ -1122,6 +1127,20 @@ class TDS2024CGUI(QMainWindow):
         self._worker.cmd_set_free_run(enabled, self._active_channels(),
                                       self._refresh_spin.value())
         self._btn_free_run.setText("■ Stop" if enabled else "▶ Free Run")
+
+    def _save_screenshot(self):
+        """Grab the full GUI window and save as PNG."""
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Save Screenshot", "", "PNG Images (*.png)"
+        )
+        if filename:
+            if not filename.lower().endswith(".png"):
+                filename += ".png"
+            pixmap = self.grab()
+            if not pixmap.save(filename, "PNG"):
+                self._on_log(f"Screenshot save failed: {filename}")
+            else:
+                self._on_log(f"Screenshot saved: {filename}")
 
     def _toggle_scope_run(self, checked: bool):
         # checked=True: button is now in the checked/active state; the button
