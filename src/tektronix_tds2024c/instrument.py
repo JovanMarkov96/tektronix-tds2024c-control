@@ -498,6 +498,23 @@ class TDS2024C:
         self._write("AUTOSet EXECUTE")
         self._wait_opc(timeout_s=10.0)
 
+    def set_math_define(self, expression: str) -> None:
+        """Set the math channel expression, e.g. ``'CH1+CH2'`` or ``'CH1-CH2'``."""
+        self._write(f'MATH:DEFine "{expression}"')
+        self.invalidate_preamble_cache()
+
+    def get_math_define(self) -> str:
+        """Return the current math expression (without surrounding quotes)."""
+        return self._query("MATH:DEFine?").strip().strip('"')
+
+    def set_math_display(self, on: bool) -> None:
+        """Turn the MATH channel display on or off."""
+        self._write(f"SELect:MATH {'ON' if on else 'OFF'}")
+
+    def get_math_display(self) -> bool:
+        """Return whether the MATH channel is currently displayed."""
+        return self._query("SELect:MATH?").strip() == "1"
+
     def save_setup(self, slot: int) -> None:
         """Save current scope setup to internal slot 1–5."""
         if not 1 <= slot <= 5:

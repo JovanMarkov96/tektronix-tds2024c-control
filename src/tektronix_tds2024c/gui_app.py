@@ -64,6 +64,7 @@ from .waveform import WaveformRecord
 
 # ── Colour palette ─────────────────────────────────────────────────────────────
 _CH_COLOURS = ["#FFD700", "#00BFFF", "#FF6B6B", "#98FB98"]   # CH1–CH4: gold, sky, red, green
+_MATH_COLOUR = "#E040FB"   # purple for math channel
 _CH_IDX = {"CH1": 0, "CH2": 1, "CH3": 2, "CH4": 3}          # source-string → colour index
 
 # ── Trigger-state display (module-level constants, not rebuilt on every call) ──
@@ -440,6 +441,18 @@ class _OscWorker(QThread):
             assert self._osc
             self._osc.set_channel_probe(ch, factor)
         self._enqueue(f"ch_probe_{ch.value}", _do)
+
+    def cmd_set_math_define(self, expression: str) -> None:
+        def _do():
+            assert self._osc
+            self._osc.set_math_define(expression)
+        self._enqueue("math_define", _do)
+
+    def cmd_set_math_display(self, on: bool) -> None:
+        def _do():
+            assert self._osc
+            self._osc.set_math_display(on)
+        self._enqueue("math_display", _do)
 
     def cmd_save_setup(self, slot: int) -> None:
         def _do():
@@ -877,6 +890,44 @@ class TDS2024CGUI(QMainWindow):
             }
             layout.addWidget(box)
 
+        # MATH channel column
+        math_box = QGroupBox("MATH")
+        math_box.setStyleSheet(
+            f"QGroupBox {{ border: 1px solid {_MATH_COLOUR}66; border-radius: 4px;"
+            f"  margin-top: 1.3ex; background-color: transparent; }}"
+            f" QGroupBox::title {{ color: {_MATH_COLOUR}; font-weight: bold;"
+            f"  subcontrol-origin: margin; left: 6px; padding: 0 3px; }}"
+        )
+        math_col = QVBoxLayout(math_box)
+        math_col.setSpacing(3)
+
+        # Expression: [CH1▾] [op▾] [CH2▾]
+        self._math_a_cb = QComboBox()
+        self._math_a_cb.addItems(["CH1", "CH2", "CH3", "CH4"])
+        math_col.addWidget(self._math_a_cb)
+
+        self._math_op_cb = QComboBox()
+        self._math_op_cb.addItems(["+", "-", "*"])
+        self._math_op_cb.setMaximumWidth(44)
+        math_col.addWidget(self._math_op_cb)
+
+        self._math_b_cb = QComboBox()
+        self._math_b_cb.addItems(["CH1", "CH2", "CH3", "CH4"])
+        self._math_b_cb.setCurrentIndex(1)   # default CH2
+        math_col.addWidget(self._math_b_cb)
+
+        self._math_scale_cb = QComboBox()
+        self._math_scale_cb.addItems(_V_DIV_LABELS)
+        self._math_scale_cb.setCurrentIndex(7)   # 500 mV/div
+        math_col.addWidget(self._math_scale_cb)
+
+        self._math_disp_cb = QCheckBox("On")
+        self._math_disp_cb.stateChanged.connect(self._on_math_display_changed)
+        math_col.addWidget(self._math_disp_cb)
+
+        math_col.addStretch()
+        layout.addWidget(math_box)
+
         layout.addWidget(self._build_acq_panel())
         return w
 
@@ -1054,6 +1105,13 @@ class TDS2024CGUI(QMainWindow):
                 pen=pg.mkPen(color=_CH_COLOURS[i], width=1),
             )
             self._plot_curves[ch] = curve
+
+        # Math channel curve
+        math_curve = self._plot_widget.plot(
+            [], [], name="MATH",
+            pen=pg.mkPen(color=_MATH_COLOUR, width=1),
+        )
+        self._plot_curves[Channel.MATH] = math_curve
 
         # Ground-reference lines: dashed horizontal line at pos_div per channel
         for i, ch in enumerate(Channel.analog()):
@@ -1239,8 +1297,11 @@ class TDS2024CGUI(QMainWindow):
 
     def _active_channels(self) -> list[Channel]:
         """Channels whose 'On' checkbox is ticked — single source of truth."""
-        return [ch for ch in Channel.analog()
-                if self._ch_widgets[ch]["display"].isChecked()]
+        chs = [ch for ch in Channel.analog()
+               if self._ch_widgets[ch]["display"].isChecked()]
+        if self._math_disp_cb.isChecked():
+            chs.append(Channel.MATH)
+        return chs
 
     def _single_shot(self):
         channels = self._active_channels()
@@ -1251,6 +1312,24 @@ class TDS2024CGUI(QMainWindow):
         self._worker.cmd_set_free_run(enabled, self._active_channels(),
                                       self._refresh_spin.value())
         self._btn_free_run.setText("■ Stop" if enabled else "▶ Free Run")
+
+    def _on_math_display_changed(self, state: int):
+        if self._suppress_signals:
+            return
+        on = bool(state)
+        expr = (f"{self._math_a_cb.currentText()}"
+                f"{self._math_op_cb.currentText()}"
+                f"{self._math_b_cb.currentText()}")
+        if on:
+            self._worker.cmd_set_math_define(expr)
+        self._worker.cmd_set_math_display(on)
+        if self._plot_curves.get(Channel.MATH):
+            self._plot_curves[Channel.MATH].setVisible(on)
+        if not on:
+            self._plot_curves[Channel.MATH].setData([], [])
+        if self._btn_free_run.isChecked():
+            self._worker.cmd_set_free_run(True, self._active_channels(),
+                                          self._refresh_spin.value())
 
     def _on_tcursors_toggled(self, on: bool):
         for line in self._t_cursors:
@@ -1448,8 +1527,14 @@ class TDS2024CGUI(QMainWindow):
         for ch, rec in data.items():
             if ch not in self._plot_curves:
                 continue
-            v_per_div = self._ch_v_per_div.get(ch, 0.5)
-            pos_div   = self._ch_position.get(ch, 0.0)
+            if ch is Channel.MATH:
+                # Math channel: use the V/div from the math scale combo
+                idx = self._math_scale_cb.currentIndex()
+                v_per_div = _V_DIV_OPTIONS[idx]
+                pos_div = 0.0
+            else:
+                v_per_div = self._ch_v_per_div.get(ch, 0.5)
+                pos_div   = self._ch_position.get(ch, 0.0)
             y_div = rec.v / v_per_div + pos_div if v_per_div > 0 else np.zeros_like(rec.v)
             self._plot_curves[ch].setData(rec.t, y_div)
 
@@ -1669,6 +1754,7 @@ class TDS2024CGUI(QMainWindow):
                     self._btn_scope_run, self._btn_default_setup,
                     self._btn_save_setup, self._btn_recall_setup):
             btn.setEnabled(connected)
+        self._math_disp_cb.setEnabled(connected)
         self._btn_connect.setEnabled(not connected)
         self._btn_disconnect.setEnabled(connected)
         if connected:
