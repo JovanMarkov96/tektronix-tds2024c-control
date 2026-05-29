@@ -592,7 +592,7 @@ class TDS2024CGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Tektronix TDS2024C")
-        self.resize(1200, 750)
+        self.resize(1400, 900)
 
         self._worker = _OscWorker()
         self._worker.connected_signal.connect(self._on_connected)
@@ -634,31 +634,21 @@ class TDS2024CGUI(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setSpacing(4)
+        root.setContentsMargins(6, 6, 6, 6)
         root.addLayout(self._build_connection_bar())
 
-        splitter = QSplitter(Qt.Horizontal)
-        root.addWidget(splitter, stretch=1)
+        # Centre area: plot (left, expands) + narrow Horizontal/Trigger column (right)
+        mid = QSplitter(Qt.Horizontal)
+        mid.addWidget(self._build_plot_panel())
+        mid.addWidget(self._build_right_panel())
+        mid.setStretchFactor(0, 1)
+        mid.setStretchFactor(1, 0)
+        root.addWidget(mid, stretch=1)
 
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setSpacing(4)
-        left_layout.addWidget(self._build_channel_panel())
-        left_layout.addWidget(self._build_horizontal_panel())
-        left_layout.addWidget(self._build_acq_panel())
-        left_layout.addWidget(self._build_trigger_panel())
-        left_layout.addStretch()
-        splitter.addWidget(left)
-
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setSpacing(4)
-        right_layout.addWidget(self._build_plot_panel(), stretch=3)
-        right_layout.addWidget(self._build_measurement_panel())
-        right_layout.addWidget(self._build_log_panel())
-        splitter.addWidget(right)
-
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
+        # Channel strip + ACQ column spanning full width below the plot
+        root.addWidget(self._build_channel_strip())
+        root.addWidget(self._build_measurement_panel())
+        root.addWidget(self._build_log_panel())
 
     def _build_connection_bar(self) -> QHBoxLayout:
         layout = QHBoxLayout()
@@ -701,18 +691,38 @@ class TDS2024CGUI(QMainWindow):
 
         return layout
 
-    def _build_channel_panel(self) -> QGroupBox:
-        box = QGroupBox("Channels")
-        layout = QHBoxLayout(box)
+    def _build_right_panel(self) -> QWidget:
+        """Narrow right column: Horizontal panel + Trigger panel stacked vertically."""
+        w = QWidget()
+        w.setMinimumWidth(195)
+        w.setMaximumWidth(245)
+        layout = QVBoxLayout(w)
+        layout.setSpacing(4)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._build_horizontal_panel())
+        layout.addWidget(self._build_trigger_panel())
+        layout.addStretch()
+        return w
+
+    def _build_channel_strip(self) -> QWidget:
+        """Bottom strip: one colored QGroupBox per channel (CH1–CH4) + ACQ column."""
+        w = QWidget()
+        layout = QHBoxLayout(w)
+        layout.setSpacing(4)
+        layout.setContentsMargins(0, 0, 0, 0)
         self._ch_widgets: dict[Channel, dict] = {}
 
         for i, ch in enumerate(Channel.analog()):
-            col = QVBoxLayout()
-            col.setSpacing(2)
-
-            lbl = QLabel(ch.value)
-            lbl.setStyleSheet(f"color: {_CH_COLOURS[i]}; font-weight: bold;")
-            col.addWidget(lbl)
+            colour = _CH_COLOURS[i]
+            box = QGroupBox(ch.value)
+            box.setStyleSheet(
+                f"QGroupBox {{ border: 1px solid {colour}66; border-radius: 4px;"
+                f"  margin-top: 1.3ex; }}"
+                f" QGroupBox::title {{ color: {colour}; font-weight: bold;"
+                f"  subcontrol-origin: margin; left: 6px; padding: 0 3px; }}"
+            )
+            col = QVBoxLayout(box)
+            col.setSpacing(3)
 
             scale_cb = QComboBox()
             scale_cb.addItems(_V_DIV_LABELS)
@@ -729,35 +739,33 @@ class TDS2024CGUI(QMainWindow):
             )
             col.addWidget(coup_cb)
 
-            col.addWidget(QLabel("Pos:"))
             pos_sb = QDoubleSpinBox()
             pos_sb.setRange(-4.0, 4.0)
             pos_sb.setSingleStep(0.5)
             pos_sb.setDecimals(2)
             pos_sb.setSuffix(" div")
             pos_sb.setValue(0.0)
-            col.addWidget(pos_sb)
             pos_sb.valueChanged.connect(lambda v, c=ch: self._on_ch_position_changed(c, v))
+            col.addWidget(pos_sb)
 
-            col.addWidget(QLabel("Probe:"))
             probe_cb = QComboBox()
             probe_cb.addItems(_PROBE_LABELS)
             probe_cb.setCurrentIndex(0)
-            col.addWidget(probe_cb)
             probe_cb.currentTextChanged.connect(lambda t, c=ch: self._on_ch_probe_changed(c, t))
+            col.addWidget(probe_cb)
 
             bw_cb = QCheckBox("20M BW")
-            col.addWidget(bw_cb)
             bw_cb.stateChanged.connect(lambda s, c=ch: self._on_ch_bwlimit_changed(c, s))
+            col.addWidget(bw_cb)
 
-            # Single "On" checkbox — single source of truth for both
-            # scope display (SELect:CH<n>) and free-run capture list.
             disp_cb = QCheckBox("On")
             disp_cb.setChecked(i == 0)    # CH1 on by default
             disp_cb.stateChanged.connect(
                 lambda state, c=ch: self._on_ch_display_changed(c, state)
             )
             col.addWidget(disp_cb)
+
+            col.addStretch()
 
             self._ch_widgets[ch] = {
                 "scale": scale_cb,
@@ -767,9 +775,10 @@ class TDS2024CGUI(QMainWindow):
                 "bwlimit": bw_cb,
                 "display": disp_cb,
             }
-            layout.addLayout(col)
+            layout.addWidget(box)
 
-        return box
+        layout.addWidget(self._build_acq_panel())
+        return w
 
     def _build_horizontal_panel(self) -> QGroupBox:
         box = QGroupBox("Horizontal")
@@ -786,20 +795,23 @@ class TDS2024CGUI(QMainWindow):
         return box
 
     def _build_acq_panel(self) -> QGroupBox:
-        box = QGroupBox("Acquisition")
-        layout = QHBoxLayout(box)
+        box = QGroupBox("ACQ")
+        layout = QVBoxLayout(box)
+        layout.setSpacing(3)
 
         self._acq_mode_cb = QComboBox()
         self._acq_mode_cb.addItems(_ACQ_MODE_DISPLAY)
         self._acq_mode_cb.currentIndexChanged.connect(self._on_acq_mode_changed)
         layout.addWidget(self._acq_mode_cb)
 
-        layout.addWidget(QLabel("Avg:"))
+        avg_row = QHBoxLayout()
+        avg_row.addWidget(QLabel("Avg:"))
         self._avg_spin = QSpinBox()
         self._avg_spin.setRange(4, 512)
         self._avg_spin.setValue(16)
         self._avg_spin.setSingleStep(4)
-        layout.addWidget(self._avg_spin)
+        avg_row.addWidget(self._avg_spin)
+        layout.addLayout(avg_row)
 
         self._btn_default_setup = QPushButton("Default Setup")
         self._btn_default_setup.clicked.connect(lambda: self._worker.cmd_default_setup())
@@ -811,57 +823,58 @@ class TDS2024CGUI(QMainWindow):
     def _build_trigger_panel(self) -> QGroupBox:
         box = QGroupBox("Trigger")
         layout = QVBoxLayout(box)
+        layout.setSpacing(3)
 
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Src:"))
+        def _row(label_text, widget):
+            row = QHBoxLayout()
+            lbl = QLabel(label_text)
+            lbl.setFixedWidth(42)
+            row.addWidget(lbl)
+            row.addWidget(widget)
+            layout.addLayout(row)
+
         self._trig_src_cb = QComboBox()
         self._trig_src_cb.addItems(["CH1", "CH2", "CH3", "CH4", "EXT", "EXT5", "LINE"])
         self._trig_src_cb.currentTextChanged.connect(self._on_trig_source_changed)
-        row1.addWidget(self._trig_src_cb)
+        _row("Src:", self._trig_src_cb)
 
-        row1.addWidget(QLabel("Level:"))
         self._trig_level_spin = QDoubleSpinBox()
         self._trig_level_spin.setRange(-50.0, 50.0)
         self._trig_level_spin.setSingleStep(0.01)
         self._trig_level_spin.setValue(0.0)
         self._trig_level_spin.setSuffix(" V")
         self._trig_level_spin.valueChanged.connect(self._on_trig_level_changed)
-        row1.addWidget(self._trig_level_spin)
+        _row("Level:", self._trig_level_spin)
 
-        row1.addWidget(QLabel("Slope:"))
         self._trig_slope_cb = QComboBox()
         self._trig_slope_cb.addItems(["Rise", "Fall"])
         self._trig_slope_cb.currentTextChanged.connect(self._on_trig_slope_changed)
-        row1.addWidget(self._trig_slope_cb)
-        layout.addLayout(row1)
+        _row("Slope:", self._trig_slope_cb)
 
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("Mode:"))
         self._trig_mode_cb = QComboBox()
         self._trig_mode_cb.addItems(["Auto", "Normal"])
         self._trig_mode_cb.currentTextChanged.connect(self._on_trig_mode_changed)
-        row2.addWidget(self._trig_mode_cb)
+        _row("Mode:", self._trig_mode_cb)
 
-        row2.addWidget(QLabel("Coup:"))
         self._trig_coup_cb = QComboBox()
         self._trig_coup_cb.addItems(_TRIG_COUP_DISPLAY)
         self._trig_coup_cb.currentTextChanged.connect(self._on_trig_coupling_changed)
-        row2.addWidget(self._trig_coup_cb)
+        _row("Coup:", self._trig_coup_cb)
 
-        self._btn_set_50pct = QPushButton("Set 50%")
+        btn_row = QHBoxLayout()
+        self._btn_set_50pct = QPushButton("50%")
         self._btn_set_50pct.clicked.connect(lambda: self._worker.cmd_trigger_to_50pct())
-        row2.addWidget(self._btn_set_50pct)
+        btn_row.addWidget(self._btn_set_50pct)
 
         self._btn_force_trig = QPushButton("Force")
         self._btn_force_trig.clicked.connect(lambda: self._worker.cmd_force_trigger())
-        row2.addWidget(self._btn_force_trig)
+        btn_row.addWidget(self._btn_force_trig)
 
         self._lbl_trig_state = QLabel("●")
         self._lbl_trig_state.setStyleSheet("color: gray; font-size: 18px;")
-        row2.addWidget(self._lbl_trig_state)
+        btn_row.addWidget(self._lbl_trig_state)
+        layout.addLayout(btn_row)
 
-        row2.addStretch()
-        layout.addLayout(row2)
         return box
 
     def _build_plot_panel(self) -> QGroupBox:
