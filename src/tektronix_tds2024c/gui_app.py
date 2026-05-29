@@ -704,6 +704,8 @@ class TDS2024CGUI(QMainWindow):
         self._vdiv_label = None    # pg.LabelItem
         self._trig_badge = None    # pg.LabelItem
         self._suppress_signals = False
+        self._t_cursors: list = []  # [T1, T2] vertical InfiniteLine items
+        self._v_cursors: list = []  # [V1, V2] horizontal InfiniteLine items
 
         # Per-channel state for divisions-based plot (updated from _on_settings)
         self._ch_v_per_div: dict[Channel, float] = {ch: 0.5 for ch in Channel.analog()}
@@ -1020,6 +1022,20 @@ class TDS2024CGUI(QMainWindow):
         self._refresh_spin.setSuffix(" ms")
         ctrl.addWidget(self._refresh_spin)
 
+        self._cb_tcursors = QCheckBox("Δt")
+        self._cb_tcursors.setToolTip("Show two draggable time cursors")
+        self._cb_tcursors.toggled.connect(self._on_tcursors_toggled)
+        ctrl.addWidget(self._cb_tcursors)
+
+        self._cb_vcursors = QCheckBox("ΔV")
+        self._cb_vcursors.setToolTip("Show two draggable voltage cursors")
+        self._cb_vcursors.toggled.connect(self._on_vcursors_toggled)
+        ctrl.addWidget(self._cb_vcursors)
+
+        self._lbl_cursors = QLabel("")
+        self._lbl_cursors.setStyleSheet("color: #aaaaaa; font-size: 10px;")
+        ctrl.addWidget(self._lbl_cursors)
+
         ctrl.addStretch()
         layout.addLayout(ctrl)
 
@@ -1058,6 +1074,30 @@ class TDS2024CGUI(QMainWindow):
             movable=False,
         )
         self._plot_widget.addItem(self._trig_line)
+
+        # Time cursors: two vertical movable lines (T1 cyan, T2 white)
+        _cursor_t_cols = ["#00E5FF", "#FFFFFF"]
+        for i, col in enumerate(_cursor_t_cols):
+            line = pg.InfiniteLine(
+                pos=((-1 if i == 0 else 1) * 2e-4), angle=90,
+                pen=pg.mkPen(col, width=1, style=Qt.DashLine), movable=True,
+            )
+            line.setVisible(False)
+            line.sigPositionChanged.connect(self._update_cursor_readout)
+            self._plot_widget.addItem(line)
+            self._t_cursors.append(line)
+
+        # Voltage cursors: two horizontal movable lines (V1 cyan, V2 white)
+        _cursor_v_poses = [1.0, -1.0]
+        for i, col in enumerate(_cursor_t_cols):
+            line = pg.InfiniteLine(
+                pos=_cursor_v_poses[i], angle=0,
+                pen=pg.mkPen(col, width=1, style=Qt.DashLine), movable=True,
+            )
+            line.setVisible(False)
+            line.sigPositionChanged.connect(self._update_cursor_readout)
+            self._plot_widget.addItem(line)
+            self._v_cursors.append(line)
 
         # V/div label strip: bottom-left corner of plot viewport.
         # Color is driven per-channel via HTML in _update_vdiv_label; we set
@@ -1211,6 +1251,36 @@ class TDS2024CGUI(QMainWindow):
         self._worker.cmd_set_free_run(enabled, self._active_channels(),
                                       self._refresh_spin.value())
         self._btn_free_run.setText("■ Stop" if enabled else "▶ Free Run")
+
+    def _on_tcursors_toggled(self, on: bool):
+        for line in self._t_cursors:
+            line.setVisible(on)
+        self._update_cursor_readout()
+
+    def _on_vcursors_toggled(self, on: bool):
+        for line in self._v_cursors:
+            line.setVisible(on)
+        self._update_cursor_readout()
+
+    def _update_cursor_readout(self):
+        parts = []
+        if self._cb_tcursors.isChecked() and len(self._t_cursors) == 2:
+            t1 = self._t_cursors[0].value()
+            t2 = self._t_cursors[1].value()
+            dt = abs(t2 - t1)
+            parts.append(f"Δt={_eng_t(dt)}")
+            if dt > 0:
+                freq = 1.0 / dt
+                if freq >= 1e6:
+                    parts.append(f"({freq/1e6:.4g} MHz)")
+                elif freq >= 1e3:
+                    parts.append(f"({freq/1e3:.4g} kHz)")
+                else:
+                    parts.append(f"({freq:.4g} Hz)")
+        if self._cb_vcursors.isChecked() and len(self._v_cursors) == 2:
+            dv = abs(self._v_cursors[1].value() - self._v_cursors[0].value())
+            parts.append(f"ΔV={dv:.3f} div")
+        self._lbl_cursors.setText("   ".join(parts))
 
     def _save_screenshot(self):
         """Grab the full GUI window and save as PNG."""
