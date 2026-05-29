@@ -115,6 +115,10 @@ _TRIG_COUP_FROM_SCPI = {                                               # SCPI up
 _ACQ_MODE_DISPLAY = ["Sample", "Peak", "Average"]
 _ACQ_MODE_ENUM    = [AcqMode.SAMPLE, AcqMode.PEAK, AcqMode.AVERAGE]
 
+# ── Probe attenuation ─────────────────────────────────────────────────────────
+_PROBE_LABELS  = ["1×", "10×", "100×", "1000×"]
+_PROBE_FACTORS = [1.0, 10.0, 100.0, 1000.0]
+
 
 def _eng_v(v_per_div: float) -> str:
     """Format V/div with engineering prefix, always includes '/div'."""
@@ -325,6 +329,27 @@ class _OscWorker(QThread):
             self._osc.force_trigger()
         self._enqueue("force_trigger", _do)
 
+    def cmd_set_channel_position(self, ch: Channel, divs: float) -> None:
+        def _do():
+            assert self._osc
+            self._osc.set_channel_position(ch, divs)
+        self._enqueue(f"ch_position_{ch.value}", _do)
+
+    def cmd_set_channel_probe(self, ch: Channel, factor: float) -> None:
+        def _do():
+            assert self._osc
+            self._osc.set_channel_probe(ch, factor)
+        self._enqueue(f"ch_probe_{ch.value}", _do)
+
+    def cmd_set_channel_bwlimit(self, ch: Channel, limited: bool) -> None:
+        def _do():
+            assert self._osc
+            from .models import BandwidthLimit
+            self._osc.set_channel_bw_limit(
+                ch, BandwidthLimit.TWENTY_MHZ if limited else BandwidthLimit.FULL
+            )
+        self._enqueue(f"ch_bwlimit_{ch.value}", _do)
+
     # ── QThread entry point ────────────────────────────────────────────────────
 
     def run(self) -> None:
@@ -499,6 +524,8 @@ class _OscWorker(QThread):
                 snap[f"{ch.value}_position"] = osc.get_channel_position(ch)
                 snap[f"{ch.value}_coupling"] = osc.get_channel_coupling(ch).value
                 snap[f"{ch.value}_display"]  = osc.get_channel_display(ch)
+                snap[f"{ch.value}_probe"]    = osc.get_channel_probe(ch)
+                snap[f"{ch.value}_bwlimit"]  = (osc.get_channel_bw_limit(ch) == BandwidthLimit.TWENTY_MHZ)
             except Exception:
                 pass
         snap["trig_level"]  = osc.get_trigger_level()
@@ -673,6 +700,27 @@ class TDS2024CGUI(QMainWindow):
             )
             col.addWidget(coup_cb)
 
+            col.addWidget(QLabel("Pos:"))
+            pos_sb = QDoubleSpinBox()
+            pos_sb.setRange(-4.0, 4.0)
+            pos_sb.setSingleStep(0.5)
+            pos_sb.setDecimals(2)
+            pos_sb.setSuffix(" div")
+            pos_sb.setValue(0.0)
+            col.addWidget(pos_sb)
+            pos_sb.valueChanged.connect(lambda v, c=ch: self._on_ch_position_changed(c, v))
+
+            col.addWidget(QLabel("Probe:"))
+            probe_cb = QComboBox()
+            probe_cb.addItems(_PROBE_LABELS)
+            probe_cb.setCurrentIndex(0)
+            col.addWidget(probe_cb)
+            probe_cb.currentTextChanged.connect(lambda t, c=ch: self._on_ch_probe_changed(c, t))
+
+            bw_cb = QCheckBox("20M BW")
+            col.addWidget(bw_cb)
+            bw_cb.stateChanged.connect(lambda s, c=ch: self._on_ch_bwlimit_changed(c, s))
+
             # Single "On" checkbox — single source of truth for both
             # scope display (SELect:CH<n>) and free-run capture list.
             disp_cb = QCheckBox("On")
@@ -685,6 +733,9 @@ class TDS2024CGUI(QMainWindow):
             self._ch_widgets[ch] = {
                 "scale": scale_cb,
                 "coupling": coup_cb,
+                "position": pos_sb,
+                "probe": probe_cb,
+                "bwlimit": bw_cb,
                 "display": disp_cb,
             }
             layout.addLayout(col)
@@ -1005,6 +1056,29 @@ class TDS2024CGUI(QMainWindow):
             self._worker.cmd_set_free_run(True, self._active_channels(),
                                           self._refresh_spin.value())
 
+    def _on_ch_position_changed(self, ch: Channel, value: float):
+        if self._suppress_signals:
+            return
+        self._ch_position[ch] = value
+        if ch in self._ground_lines:
+            self._ground_lines[ch].setPos(value)
+        self._update_trig_line()
+        self._update_vdiv_label()
+        self._worker.cmd_set_channel_position(ch, value)
+
+    def _on_ch_probe_changed(self, ch: Channel, text: str):
+        if self._suppress_signals:
+            return
+        idx = _PROBE_LABELS.index(text) if text in _PROBE_LABELS else 0
+        factor = _PROBE_FACTORS[idx]
+        self._worker.cmd_set_channel_probe(ch, factor)
+
+    def _on_ch_bwlimit_changed(self, ch: Channel, state: int):
+        if self._suppress_signals:
+            return
+        limited = bool(state)
+        self._worker.cmd_set_channel_bwlimit(ch, limited)
+
     # -- Horizontal --
 
     def _on_time_scale_changed(self, idx: int):
@@ -1131,9 +1205,21 @@ class TDS2024CGUI(QMainWindow):
 
                 pos_key = f"{ch.value}_position"
                 if pos_key in snap:
-                    self._ch_position[ch] = snap[pos_key]
+                    pos = snap[pos_key]
+                    self._ch_position[ch] = pos
+                    w["position"].setValue(pos)
                     if ch in self._ground_lines:
-                        self._ground_lines[ch].setPos(snap[pos_key])
+                        self._ground_lines[ch].setPos(pos)
+
+                probe_key = f"{ch.value}_probe"
+                if probe_key in snap:
+                    factor = snap[probe_key]
+                    closest = min(range(len(_PROBE_FACTORS)), key=lambda i: abs(_PROBE_FACTORS[i] - factor))
+                    w["probe"].setCurrentIndex(closest)
+
+                bw_key = f"{ch.value}_bwlimit"
+                if bw_key in snap:
+                    w["bwlimit"].setChecked(snap[bw_key])
 
                 coup_key = f"{ch.value}_coupling"
                 if coup_key in snap:
