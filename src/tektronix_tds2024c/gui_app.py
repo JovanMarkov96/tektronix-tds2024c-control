@@ -441,6 +441,19 @@ class _OscWorker(QThread):
             self._osc.set_channel_probe(ch, factor)
         self._enqueue(f"ch_probe_{ch.value}", _do)
 
+    def cmd_save_setup(self, slot: int) -> None:
+        def _do():
+            assert self._osc
+            self._osc.save_setup(slot)
+        self._enqueue(f"save_setup_{slot}", _do)
+
+    def cmd_recall_setup(self, slot: int) -> None:
+        def _do():
+            assert self._osc
+            self._osc.recall_setup(slot)
+            self._emit_settings_snapshot()   # sync GUI with recalled settings
+        self._enqueue(f"recall_setup_{slot}", _do)
+
     def cmd_set_channel_bwlimit(self, ch: Channel, limited: bool) -> None:
         def _do():
             assert self._osc
@@ -901,6 +914,30 @@ class TDS2024CGUI(QMainWindow):
         self._btn_default_setup = QPushButton("Default Setup")
         self._btn_default_setup.clicked.connect(lambda: self._worker.cmd_default_setup())
         layout.addWidget(self._btn_default_setup)
+
+        # Save / Recall setup slots 1–5
+        slot_row = QHBoxLayout()
+        slot_row.addWidget(QLabel("Slot:"))
+        self._setup_slot_spin = QSpinBox()
+        self._setup_slot_spin.setRange(1, 5)
+        self._setup_slot_spin.setValue(1)
+        self._setup_slot_spin.setFixedWidth(36)
+        slot_row.addWidget(self._setup_slot_spin)
+        layout.addLayout(slot_row)
+
+        save_row = QHBoxLayout()
+        self._btn_save_setup = QPushButton("Save")
+        self._btn_save_setup.clicked.connect(
+            lambda: self._worker.cmd_save_setup(self._setup_slot_spin.value())
+        )
+        save_row.addWidget(self._btn_save_setup)
+
+        self._btn_recall_setup = QPushButton("Recall")
+        self._btn_recall_setup.clicked.connect(
+            lambda: self._worker.cmd_recall_setup(self._setup_slot_spin.value())
+        )
+        save_row.addWidget(self._btn_recall_setup)
+        layout.addLayout(save_row)
 
         layout.addStretch()
         return box
@@ -1559,7 +1596,8 @@ class TDS2024CGUI(QMainWindow):
     def _set_connected(self, connected: bool):
         for btn in (self._btn_single, self._btn_free_run, self._btn_autoset,
                     self._btn_measure, self._btn_force_trig, self._btn_set_50pct,
-                    self._btn_scope_run, self._btn_default_setup):
+                    self._btn_scope_run, self._btn_default_setup,
+                    self._btn_save_setup, self._btn_recall_setup):
             btn.setEnabled(connected)
         self._btn_connect.setEnabled(not connected)
         self._btn_disconnect.setEnabled(connected)

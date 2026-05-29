@@ -498,6 +498,18 @@ class TDS2024C:
         self._write("AUTOSet EXECUTE")
         self._wait_opc(timeout_s=10.0)
 
+    def save_setup(self, slot: int) -> None:
+        """Save current scope setup to internal slot 1–5."""
+        if not 1 <= slot <= 5:
+            raise ValueError(f"Setup slot must be 1–5, got {slot}")
+        self._write(f"SAVe:SETUp {slot}")
+
+    def recall_setup(self, slot: int) -> None:
+        """Recall scope setup from internal slot 1–5."""
+        if not 1 <= slot <= 5:
+            raise ValueError(f"Setup slot must be 1–5, got {slot}")
+        self._write(f"RECAll:SETUp {slot}")
+
     def lock_front_panel(self) -> None:
         self._write("LOCk ALL")
 
