@@ -288,10 +288,16 @@ class _OscWorker(QThread):
         self._last_trig_poll = 0.0
         self._last_emitted_state: dict = {}
         self._last_trig_state = ""
-        # Preamble refresh flag: set True when free-run starts so the first
-        # capture re-reads WFMPre? for all channels (picks up any front-panel
-        # V/div / time-base changes made while the scope was idle).
+        # Preamble refresh flag: set True when free-run starts (and after
+        # autoset / default-setup / recall) so the next capture re-reads WFMPre?
+        # for all channels, picking up any V/div / time-base changes.
         self._free_run_needs_preamble_refresh = False
+        # Periodic preamble refresh during free-run: re-read WFMPre? for every
+        # active channel every ~1 s so front-panel knob changes made *while the
+        # GUI is streaming* are reflected.  WFMPre? is a single fast query, so
+        # the cost is negligible compared with the per-frame CURVe? transfer.
+        self._last_preamble_refresh = 0.0
+        self._preamble_refresh_interval_s = 1.0
 
     # ── Public API (called from GUI thread) ────────────────────────────────────
 
@@ -358,6 +364,9 @@ class _OscWorker(QThread):
         def _do():
             assert self._osc
             self._osc.autoset()
+            # Force the next free-run frame to re-read WFMPre? for all channels
+            # (autoset rescaled the timebase + every channel).
+            self._free_run_needs_preamble_refresh = True
             self._emit_settings_snapshot()
         self._enqueue("autoset", _do)
 
@@ -377,6 +386,7 @@ class _OscWorker(QThread):
         def _do():
             assert self._osc
             self._osc.reset()
+            self._free_run_needs_preamble_refresh = True
             self._emit_settings_snapshot()
         self._enqueue("default_setup", _do)
 
@@ -494,6 +504,7 @@ class _OscWorker(QThread):
         def _do():
             assert self._osc
             self._osc.recall_setup(slot)
+            self._free_run_needs_preamble_refresh = True
             self._emit_settings_snapshot()   # sync GUI with recalled settings
         self._enqueue(f"recall_setup_{slot}", _do)
 
@@ -648,10 +659,18 @@ class _OscWorker(QThread):
         self.log_signal.emit("Disconnected")
 
     def _do_free_run_capture(self) -> None:
-        # Consume the one-shot preamble-refresh flag.  True only on the first
-        # frame after free-run starts, ensuring V/div / timebase changes made
-        # from the scope front panel while idle are picked up immediately.
+        # Refresh the cached preamble (WFMPre?) for every channel this frame when:
+        #   • the one-shot flag is set (free-run just started, or autoset /
+        #     default-setup / recall just ran), OR
+        #   • the periodic interval has elapsed — so front-panel V/div / timebase
+        #     knob changes made *while streaming* are reflected within ~1 s.
+        now = time.monotonic()
         refresh = self._free_run_needs_preamble_refresh
+        if not refresh and (now - self._last_preamble_refresh
+                            >= self._preamble_refresh_interval_s):
+            refresh = True
+        if refresh:
+            self._last_preamble_refresh = now
         self._free_run_needs_preamble_refresh = False
 
         records = {}
@@ -1480,6 +1499,11 @@ class TDS2024CGUI(QMainWindow):
         self._worker.cmd_set_channel_display(ch, on)
         if ch in self._ground_lines:
             self._ground_lines[ch].setVisible(on)
+        # Clear the trace immediately when a channel is turned off — otherwise
+        # the last captured frame lingers on the plot (it is simply no longer
+        # in the free-run capture list, so it never gets refreshed or removed).
+        if not on and ch in self._plot_curves:
+            self._plot_curves[ch].setData([], [])
         self._update_vdiv_label()
         # Keep free-run capture list in sync with the checkbox state
         if self._btn_free_run.isChecked():
@@ -1589,11 +1613,20 @@ class TDS2024CGUI(QMainWindow):
             if ch not in self._plot_curves:
                 continue
             if ch is Channel.MATH:
+                # Drop a stale/in-flight MATH frame if math is no longer enabled.
+                if not self._math_disp_cb.isChecked():
+                    self._plot_curves[ch].setData([], [])
+                    continue
                 # Math channel: use the V/div from the math scale combo
                 idx = self._math_scale_cb.currentIndex()
                 v_per_div = _V_DIV_OPTIONS[idx]
                 pos_div = 0.0
             else:
+                # Drop a stale/in-flight frame for a channel just switched off,
+                # so a turned-off trace can never reappear and linger.
+                if not self._ch_widgets[ch]["display"].isChecked():
+                    self._plot_curves[ch].setData([], [])
+                    continue
                 v_per_div = self._ch_v_per_div.get(ch, 0.5)
                 pos_div   = self._ch_position.get(ch, 0.0)
             y_div = rec.v / v_per_div + pos_div if v_per_div > 0 else np.zeros_like(rec.v)
@@ -1683,6 +1716,10 @@ class TDS2024CGUI(QMainWindow):
                     w["display"].setChecked(on)
                     if ch in self._ground_lines:
                         self._ground_lines[ch].setVisible(on)
+                    # Clear a lingering trace if the channel was switched off
+                    # from the front panel.
+                    if not on and ch in self._plot_curves:
+                        self._plot_curves[ch].setData([], [])
 
             if "trig_level" in snap:
                 self._trig_level_v = snap["trig_level"]

@@ -116,6 +116,9 @@ class TDS2024C:
         """``*RST`` factory reset, then wait for completion."""
         self._write("*RST")
         self._wait_opc()
+        # *RST changes timebase / per-channel scaling, so every cached preamble
+        # (XINcr / YMUlt / YOFf / YZEro) is now stale.
+        self.invalidate_preamble_cache()
 
     def clear_status(self) -> None:
         self._write("*CLS")
@@ -497,6 +500,11 @@ class TDS2024C:
         """``AUTOSet EXECUTE``, then wait for completion."""
         self._write("AUTOSet EXECUTE")
         self._wait_opc(timeout_s=10.0)
+        # AutoSet rescales the timebase and every active channel, so all cached
+        # preambles (XINcr / YMUlt / YOFf / YZEro) are now stale and must be
+        # re-fetched on the next read.  Without this the live plot keeps using
+        # the pre-autoset scaling and X/Y no longer match the device.
+        self.invalidate_preamble_cache()
 
     def set_math_define(self, expression: str) -> None:
         """Set the math channel expression, e.g. ``'CH1+CH2'`` or ``'CH1-CH2'``."""
@@ -526,6 +534,9 @@ class TDS2024C:
         if not 1 <= slot <= 5:
             raise ValueError(f"Setup slot must be 1–5, got {slot}")
         self._write(f"RECAll:SETUp {slot}")
+        # A recalled setup can change timebase / scaling, so cached preambles
+        # are stale.
+        self.invalidate_preamble_cache()
 
     def lock_front_panel(self) -> None:
         self._write("LOCk ALL")
