@@ -21,7 +21,6 @@ import numpy as np
 try:
     import pyqtgraph as pg
     from qtpy.QtCore import QThread, QTimer, Signal, Qt
-    from qtpy.QtGui import QColor, QFont
     from qtpy.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -57,14 +56,14 @@ from .models import (
     TriggerMode,
     TriggerSlope,
     TriggerSource,
-    TriggerType,
-    WfmEncoding,
 )
 from .waveform import WaveformRecord
 
 # ── Colour palette ─────────────────────────────────────────────────────────────
-_CH_COLOURS = ["#FFD700", "#00BFFF", "#FF6B6B", "#98FB98"]   # CH1–CH4: gold, sky, red, green
-_MATH_COLOUR = "#E040FB"   # purple for math channel
+# Matches the TDS2024C front-panel colour code (see 01_FRONT_PANEL_GROUND_TRUTH.md):
+#   CH1 yellow · CH2 cyan · CH3 magenta · CH4 green · Math red
+_CH_COLOURS = ["#FFD700", "#26C6FF", "#E040FB", "#4CE04C"]   # CH1–CH4
+_MATH_COLOUR = "#FF5252"   # red for math channel (per front panel)
 _CH_IDX = {"CH1": 0, "CH2": 1, "CH3": 2, "CH4": 3}          # source-string → colour index
 
 # ── Trigger-state display (module-level constants, not rebuilt on every call) ──
@@ -151,6 +150,43 @@ def _eng_t(s_per_div: float) -> str:
     return f"{s_per_div:.3g} s/div"
 
 
+def _rgba(hex_colour: str, alpha: float) -> str:
+    """Convert '#RRGGBB' + alpha (0–1) to a QSS-safe 'rgba(r, g, b, a)' string.
+
+    Qt Style Sheets do not reliably parse 8-digit '#RRGGBBAA' hex, so colour
+    fills/borders that need transparency must use the rgba() functional form.
+    """
+    h = hex_colour.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r}, {g}, {b}, {alpha:.3f})"
+
+
+def _channel_box_qss(colour: str) -> str:
+    """Stylesheet for a channel/math group box: coloured title + faint border."""
+    return (
+        f"QGroupBox {{ border: 1px solid {_rgba(colour, 0.4)}; border-radius: 4px;"
+        f"  margin-top: 1.3ex; background-color: transparent; }}"
+        f" QGroupBox::title {{ color: {colour}; font-weight: bold;"
+        f"  subcontrol-origin: margin; left: 6px; padding: 0 3px; }}"
+    )
+
+
+def _eng_seconds(s: float) -> str:
+    """Format a plain time *interval* (no '/div') with an engineering prefix."""
+    a = abs(s)
+    if a == 0:
+        return "0 s"
+    if a >= 1.0:
+        return f"{s:.4g} s"
+    if a >= 1e-3:
+        return f"{s*1e3:.4g} ms"
+    if a >= 1e-6:
+        return f"{s*1e6:.4g} µs"
+    if a >= 1e-9:
+        return f"{s*1e9:.4g} ns"
+    return f"{s:.3g} s"
+
+
 def _closest_index(options: list, value: float) -> int:
     """Return the index in *options* whose value is closest to *value*."""
     return min(range(len(options)), key=lambda i: abs(options[i] - value))
@@ -232,7 +268,6 @@ class _OscWorker(QThread):
     connected_signal    = Signal(str)
     disconnected_signal = Signal()
     waveform_signal     = Signal(object)           # dict[Channel, WaveformRecord]
-    measurement_signal    = Signal(float, str, str)     # value, units, type_name (legacy)
     measurement_ex_signal = Signal(float, str, str, int) # value, units, type_name, slot_idx
     settings_signal     = Signal(dict)             # scope settings snapshot (no trig_state)
     log_signal          = Signal(str)
@@ -307,17 +342,6 @@ class _OscWorker(QThread):
             # fires on the very next idle loop iteration (immediate GUI sync).
             self._last_settings_poll = 0.0
 
-    def cmd_measure(self, ch: Channel, mtype: MeasType) -> None:
-        def _do():
-            assert self._osc
-            try:
-                val = self._osc.measure(ch, mtype)
-                units = self._osc.get_immed_units()
-                self.measurement_signal.emit(val, units, mtype.value)
-            except TDS2024CMeasurementError:
-                self.measurement_signal.emit(float("nan"), "", mtype.value)
-        self._enqueue("measure", _do)
-
     def cmd_measure_ex(self, ch: Channel, mtype: MeasType, slot_idx: int) -> None:
         """Measure one slot and emit measurement_ex_signal with the slot index."""
         def _do():
@@ -379,6 +403,12 @@ class _OscWorker(QThread):
             assert self._osc
             self._osc.set_time_scale(s_per_div)
         self._enqueue("time_scale", _do)
+
+    def cmd_set_time_position(self, seconds: float) -> None:
+        def _do():
+            assert self._osc
+            self._osc.set_time_position(seconds)
+        self._enqueue("time_position", _do)
 
     def cmd_set_trigger_level(self, volts: float) -> None:
         def _do():
@@ -644,6 +674,10 @@ class _OscWorker(QThread):
         osc = self._osc
         snap: dict = {}
         snap["time_scale"] = osc.get_time_scale()
+        try:
+            snap["time_position"] = osc.get_time_position()
+        except Exception:
+            pass
         for ch in Channel.analog():
             try:
                 snap[f"{ch.value}_scale"]    = osc.get_channel_scale(ch)
@@ -746,6 +780,12 @@ class TDS2024CGUI(QMainWindow):
         root.setContentsMargins(6, 6, 6, 6)
         root.addLayout(self._build_connection_bar())
 
+        # Build the channel strip FIRST — it creates self._ch_widgets and
+        # self._math_disp_cb, which _build_plot_panel() depends on (its
+        # _update_vdiv_label() reads the per-channel display checkboxes).
+        # The widget is added to the layout further down, in display order.
+        channel_strip = self._build_channel_strip()
+
         # Centre area: plot (left, expands) + narrow Horizontal/Trigger column (right)
         mid = QSplitter(Qt.Horizontal)
         mid.addWidget(self._build_plot_panel())
@@ -755,7 +795,7 @@ class TDS2024CGUI(QMainWindow):
         root.addWidget(mid, stretch=1)
 
         # Channel strip + ACQ column spanning full width below the plot
-        root.addWidget(self._build_channel_strip())
+        root.addWidget(channel_strip)
         root.addWidget(self._build_measurement_panel())
         root.addWidget(self._build_log_panel())
 
@@ -828,12 +868,7 @@ class TDS2024CGUI(QMainWindow):
         for i, ch in enumerate(Channel.analog()):
             colour = _CH_COLOURS[i]
             box = QGroupBox(ch.value)
-            box.setStyleSheet(
-                f"QGroupBox {{ border: 1px solid {colour}66; border-radius: 4px;"
-                f"  margin-top: 1.3ex; background-color: transparent; }}"
-                f" QGroupBox::title {{ color: {colour}; font-weight: bold;"
-                f"  subcontrol-origin: margin; left: 6px; padding: 0 3px; }}"
-            )
+            box.setStyleSheet(_channel_box_qss(colour))
             col = QVBoxLayout(box)
             col.setSpacing(3)
 
@@ -892,12 +927,7 @@ class TDS2024CGUI(QMainWindow):
 
         # MATH channel column
         math_box = QGroupBox("MATH")
-        math_box.setStyleSheet(
-            f"QGroupBox {{ border: 1px solid {_MATH_COLOUR}66; border-radius: 4px;"
-            f"  margin-top: 1.3ex; background-color: transparent; }}"
-            f" QGroupBox::title {{ color: {_MATH_COLOUR}; font-weight: bold;"
-            f"  subcontrol-origin: margin; left: 6px; padding: 0 3px; }}"
-        )
+        math_box.setStyleSheet(_channel_box_qss(_MATH_COLOUR))
         math_col = QVBoxLayout(math_box)
         math_col.setSpacing(3)
 
@@ -933,16 +963,32 @@ class TDS2024CGUI(QMainWindow):
 
     def _build_horizontal_panel(self) -> QGroupBox:
         box = QGroupBox("Horizontal")
-        layout = QHBoxLayout(box)
+        layout = QVBoxLayout(box)
+        layout.setSpacing(3)
 
-        layout.addWidget(QLabel("Time/div:"))
+        scale_row = QHBoxLayout()
+        lbl_s = QLabel("Time/div:")
+        lbl_s.setFixedWidth(58)
+        scale_row.addWidget(lbl_s)
         self._time_scale_cb = QComboBox()
         self._time_scale_cb.addItems(_T_DIV_LABELS)
         self._time_scale_cb.setCurrentIndex(13)   # 100 µs/div
         self._time_scale_cb.currentIndexChanged.connect(self._on_time_scale_changed)
-        layout.addWidget(self._time_scale_cb)
+        scale_row.addWidget(self._time_scale_cb)
+        layout.addLayout(scale_row)
 
-        layout.addStretch()
+        pos_row = QHBoxLayout()
+        lbl_p = QLabel("Pos:")
+        lbl_p.setFixedWidth(58)
+        pos_row.addWidget(lbl_p)
+        self._time_pos_spin = _EngSpinBox("s")
+        self._time_pos_spin.setRange(-10.0, 10.0)
+        self._time_pos_spin.setSingleStep(1e-6)
+        self._time_pos_spin.setValue(0.0)
+        self._time_pos_spin.valueChanged.connect(self._on_time_position_changed)
+        pos_row.addWidget(self._time_pos_spin)
+        layout.addLayout(pos_row)
+
         return box
 
     def _build_acq_panel(self) -> QGroupBox:
@@ -1133,9 +1179,10 @@ class TDS2024CGUI(QMainWindow):
         )
         self._plot_widget.addItem(self._trig_line)
 
-        # Time cursors: two vertical movable lines (T1 cyan, T2 white)
-        _cursor_t_cols = ["#00E5FF", "#FFFFFF"]
-        for i, col in enumerate(_cursor_t_cols):
+        # Time cursors: two vertical movable lines (amber + white — deliberately
+        # NOT a channel colour so they don't read as a trace).
+        _cursor_cols = ["#FFB300", "#FFFFFF"]
+        for i, col in enumerate(_cursor_cols):
             line = pg.InfiniteLine(
                 pos=((-1 if i == 0 else 1) * 2e-4), angle=90,
                 pen=pg.mkPen(col, width=1, style=Qt.DashLine), movable=True,
@@ -1145,9 +1192,9 @@ class TDS2024CGUI(QMainWindow):
             self._plot_widget.addItem(line)
             self._t_cursors.append(line)
 
-        # Voltage cursors: two horizontal movable lines (V1 cyan, V2 white)
+        # Voltage cursors: two horizontal movable lines (amber + white)
         _cursor_v_poses = [1.0, -1.0]
-        for i, col in enumerate(_cursor_t_cols):
+        for i, col in enumerate(_cursor_cols):
             line = pg.InfiniteLine(
                 pos=_cursor_v_poses[i], angle=0,
                 pen=pg.mkPen(col, width=1, style=Qt.DashLine), movable=True,
@@ -1347,7 +1394,7 @@ class TDS2024CGUI(QMainWindow):
             t1 = self._t_cursors[0].value()
             t2 = self._t_cursors[1].value()
             dt = abs(t2 - t1)
-            parts.append(f"Δt={_eng_t(dt)}")
+            parts.append(f"Δt={_eng_seconds(dt)}")
             if dt > 0:
                 freq = 1.0 / dt
                 if freq >= 1e6:
@@ -1357,8 +1404,17 @@ class TDS2024CGUI(QMainWindow):
                 else:
                     parts.append(f"({freq:.4g} Hz)")
         if self._cb_vcursors.isChecked() and len(self._v_cursors) == 2:
-            dv = abs(self._v_cursors[1].value() - self._v_cursors[0].value())
-            parts.append(f"ΔV={dv:.3f} div")
+            d_div = abs(self._v_cursors[1].value() - self._v_cursors[0].value())
+            # Convert divisions → volts using the first displayed channel's V/div
+            ref_ch = next((ch for ch in Channel.analog()
+                           if self._ch_widgets[ch]["display"].isChecked()), None)
+            if ref_ch is not None:
+                v_per_div = self._ch_v_per_div.get(ref_ch, 0.5)
+                dv = d_div * v_per_div
+                vtxt = (f"{dv*1e3:.3g} mV" if abs(dv) < 1.0 else f"{dv:.3g} V")
+                parts.append(f"ΔV={vtxt} ({ref_ch.value})")
+            else:
+                parts.append(f"ΔV={d_div:.3f} div")
         self._lbl_cursors.setText("   ".join(parts))
 
     def _save_screenshot(self):
@@ -1461,6 +1517,11 @@ class TDS2024CGUI(QMainWindow):
         self._time_scale_s = _T_DIV_OPTIONS[idx]
         self._update_vdiv_label()
         self._worker.cmd_set_time_scale(_T_DIV_OPTIONS[idx])
+
+    def _on_time_position_changed(self, value: float):
+        if self._suppress_signals:
+            return
+        self._worker.cmd_set_time_position(value)
 
     # -- Acquisition --
 
@@ -1578,6 +1639,9 @@ class TDS2024CGUI(QMainWindow):
                 # Use pre-built lookup; fall back to closest match for non-standard values
                 idx = _T_DIV_INDEX.get(val, _closest_index(_T_DIV_OPTIONS, val))
                 self._time_scale_cb.setCurrentIndex(idx)
+
+            if "time_position" in snap:
+                self._time_pos_spin.setValue(snap["time_position"])
 
             for ch in Channel.analog():
                 w = self._ch_widgets[ch]
