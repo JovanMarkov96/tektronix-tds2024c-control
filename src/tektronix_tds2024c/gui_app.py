@@ -154,6 +154,72 @@ def _closest_index(options: list, value: float) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Engineering-prefix spinbox
+# ─────────────────────────────────────────────────────────────────────────────
+
+# (factor, prefix-char, display-char)  — longest prefix checked first in parse
+_ENG_PREFIXES = [
+    (1e6,  "M",  "M"),
+    (1e3,  "k",  "k"),
+    (1.0,  "",   ""),
+    (1e-3, "m",  "m"),
+    (1e-6, "u",  "µ"),
+    (1e-9, "n",  "n"),
+]
+
+
+class _EngSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox that formats its value with SI prefixes (V → mV, µV …)."""
+
+    def __init__(self, unit: str = "V", parent=None):
+        super().__init__(parent)
+        self._unit = unit
+        self.setDecimals(12)   # high internal precision; display via textFromValue
+
+    def textFromValue(self, v: float) -> str:
+        if v == 0.0:
+            return f"0.000 {self._unit}"
+        abs_v = abs(v)
+        for factor, _, disp in _ENG_PREFIXES:
+            if abs_v >= factor * 0.9995:
+                scaled = v / factor
+                # 4 significant figures with trailing zeros preserved
+                mag = int(math.floor(math.log10(abs(scaled)))) if scaled != 0 else 0
+                decimals = max(0, 3 - mag)
+                return f"{scaled:.{decimals}f} {disp}{self._unit}"
+        # Below nano
+        factor, _, disp = _ENG_PREFIXES[-1]
+        scaled = v / factor
+        mag = int(math.floor(math.log10(abs(scaled)))) if scaled != 0 else 0
+        decimals = max(0, 3 - mag)
+        return f"{scaled:.{decimals}f} {disp}{self._unit}"
+
+    def valueFromText(self, text: str) -> float:
+        t = text.strip()
+        # Build suffix list ordered by suffix length (longest first to avoid
+        # "V" matching before "mV" when unit == "V")
+        candidates = sorted(
+            _ENG_PREFIXES, key=lambda x: -(len(x[2]) + len(self._unit))
+        )
+        for factor, parse_char, disp_char in candidates:
+            for char in (disp_char, parse_char):   # accept both "µ" and "u"
+                suffix = f"{char}{self._unit}"
+                if t.endswith(suffix):
+                    try:
+                        return float(t[: -len(suffix)].strip()) * factor
+                    except ValueError:
+                        return 0.0
+        try:
+            return float(t)
+        except ValueError:
+            return 0.0
+
+    def validate(self, text: str, pos: int):
+        from qtpy.QtGui import QValidator
+        return QValidator.Acceptable, text, pos
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Worker thread
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -838,11 +904,10 @@ class TDS2024CGUI(QMainWindow):
         self._trig_src_cb.currentTextChanged.connect(self._on_trig_source_changed)
         _row("Src:", self._trig_src_cb)
 
-        self._trig_level_spin = QDoubleSpinBox()
+        self._trig_level_spin = _EngSpinBox("V")
         self._trig_level_spin.setRange(-50.0, 50.0)
-        self._trig_level_spin.setSingleStep(0.01)
+        self._trig_level_spin.setSingleStep(0.001)
         self._trig_level_spin.setValue(0.0)
-        self._trig_level_spin.setSuffix(" V")
         self._trig_level_spin.valueChanged.connect(self._on_trig_level_changed)
         _row("Level:", self._trig_level_spin)
 
