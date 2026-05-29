@@ -717,7 +717,7 @@ class TDS2024CGUI(QMainWindow):
             box = QGroupBox(ch.value)
             box.setStyleSheet(
                 f"QGroupBox {{ border: 1px solid {colour}66; border-radius: 4px;"
-                f"  margin-top: 1.3ex; }}"
+                f"  margin-top: 1.3ex; background-color: transparent; }}"
                 f" QGroupBox::title {{ color: {colour}; font-weight: bold;"
                 f"  subcontrol-origin: margin; left: 6px; padding: 0 3px; }}"
             )
@@ -1447,6 +1447,11 @@ def main():
         )
     import sys
     app = QApplication.instance() or QApplication(sys.argv)
+    try:
+        import qdarkstyle
+        app.setStyleSheet(qdarkstyle.load_stylesheet())
+    except ImportError:
+        pass
     win = TDS2024CGUI()
     win.show()
     sys.exit(app.exec_() if hasattr(app, "exec_") else app.exec())
